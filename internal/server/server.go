@@ -2,13 +2,17 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -62,7 +66,16 @@ func ListenAndServe(addr string, web fs.FS) error {
 // listenUnix binds a socket that the same user (and, on OPNsense, group www) can use.
 // Mode 0660 so a local reverse proxy can connect without making the socket world-writable.
 func listenUnix(path string) (net.Listener, error) {
-	_ = os.Remove(path)
+	if info, err := os.Stat(path); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("refusing to replace %s: not a unix socket", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err
@@ -101,7 +114,11 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
 	name, raw, err := readUpload(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status := http.StatusBadRequest
+		if isTooLarge(err) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	backend := r.FormValue("dhcp")
@@ -115,8 +132,12 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 
 func readUpload(r *http.Request) (string, string, error) {
 	ct := r.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "multipart/form-data") {
-		if err := r.ParseMultipartForm(32 << 20); err != nil {
+	media, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		media = strings.TrimSpace(strings.ToLower(ct))
+	}
+	if strings.EqualFold(media, "multipart/form-data") {
+		if err := r.ParseMultipartForm(4 << 20); err != nil {
 			return "", "", err
 		}
 		file, hdr, err := r.FormFile("file")
@@ -131,8 +152,23 @@ func readUpload(r *http.Request) (string, string, error) {
 		if err != nil {
 			return "", "", err
 		}
-		return hdr.Filename, string(data), nil
+		name := "config.xml"
+		if hdr != nil && hdr.Filename != "" {
+			name = filepath.Base(hdr.Filename)
+		}
+		return name, string(data), nil
+	}
+	if media != "" && !strings.EqualFold(media, "application/xml") &&
+		!strings.EqualFold(media, "text/xml") &&
+		!strings.EqualFold(media, "application/octet-stream") &&
+		!strings.EqualFold(media, "text/plain") {
+		return "", "", fmt.Errorf("unsupported Content-Type %s; POST multipart/form-data with a file field, or raw XML", media)
 	}
 	data, err := io.ReadAll(r.Body)
 	return "config.xml", string(data), err
+}
+
+func isTooLarge(err error) bool {
+	var maxErr *http.MaxBytesError
+	return errors.As(err, &maxErr)
 }

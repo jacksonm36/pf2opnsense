@@ -3,7 +3,9 @@ package mapper
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +39,8 @@ type Stats struct {
 	OpenvpnClients    int `json:"openvpnClients"`
 	OpenvpnUsers      int `json:"openvpnUsers"`
 	UserCerts         int `json:"userCerts"`
+	WireguardTunnels  int `json:"wireguardTunnels"`
+	WireguardPeers    int `json:"wireguardPeers"`
 	Packages          int `json:"packages"`
 }
 
@@ -124,7 +128,9 @@ var dyndnsService = map[string]string{
 var packageToPlugin = map[string]string{
 	"openvpn-client-export":         "os-openvpn-client-export",
 	"openvpn client export utility": "os-openvpn-client-export",
-	"wireguard":                     "os-wireguard", "acme": "os-acme-client", "acme-client": "os-acme-client",
+	// WireGuard has no os- plugin: it is part of OPNsense core and is mapped
+	// natively by mapWireGuard.
+	"acme": "os-acme-client", "acme-client": "os-acme-client",
 	"nmap": "os-nmap", "iperf": "os-iperf", "lldpd": "os-lldpd",
 	"mdns-repeater": "os-mdns-repeater", "avahi": "os-mdns-repeater", "nut": "os-nut",
 	"frr": "os-frr", "bind": "os-bind", "haproxy": "os-haproxy", "nginx": "os-nginx",
@@ -220,6 +226,12 @@ func mapPfSense(input map[string]any, opt *Options) (*Result, error) {
 	dnsmasq, kea := mapDHCP(pfsense, opt, &report)
 	vlans, vlanRenames := mapVlans(pfsense, opt, &report)
 	openvpn := mapOpenVPN(pfsense, opt, &report)
+	// WireGuard must be mapped before packages so the pfSense package block can
+	// be dropped and left out of the "copied packages" note.
+	wireguard, wgRenames := mapWireGuard(pfsense, opt, &report)
+	if wireguard != nil {
+		dropPfSenseWireGuard(pfsense)
+	}
 	packages := mapPackages(pfsense, &report)
 	dyndns := mapDynDNS(pfsense, opt, &report)
 	ipsec, swanctl := mapIPsec(pfsense, opt, &report)
@@ -231,11 +243,11 @@ func mapPfSense(input map[string]any, opt *Options) (*Result, error) {
 	if !xmlutil.IsEmptySection(pfsense["captiveportal"]) {
 		report.Notes = append(report.Notes, "Captive portal config was copied; confirm it under Services → Captive Portal after import.")
 	}
-	if pfsense["wireguard"] != nil || xmlutil.Get(pfsense, "installedpackages", "wireguard") != nil {
-		report.Notes = append(report.Notes, "WireGuard config was copied; install os-wireguard on OPNsense if it is not already present.")
-	}
 	if openvpn != nil {
 		opnMVC["OpenVPN"] = openvpn
+	}
+	if wireguard != nil {
+		opnMVC["wireguard"] = wireguard
 	}
 	if dyndns != nil {
 		opnMVC["DynDNS"] = dyndns
@@ -267,7 +279,7 @@ func mapPfSense(input map[string]any, opt *Options) (*Result, error) {
 		},
 		"revision": map[string]any{
 			"username":    "pf2opn",
-			"time":        fmt.Sprintf("%v", float64(time.Now().UnixMilli())/1000),
+			"time":        revisionUnixTime(),
 			"description": fmt.Sprintf("Converted from pfSense %s by pf2opn for OPNsense %s", PfRelease, OpnTarget()),
 		},
 		"OPNsense": opnMVC,
@@ -304,8 +316,34 @@ func mapPfSense(input map[string]any, opt *Options) (*Result, error) {
 		report.Notes = append(report.Notes, "Gateway groups were copied in legacy form; confirm them under System → Gateways.")
 	}
 	rewriteDeviceNames(opnsense, vlanRenames)
+	rewriteDeviceNames(opnsense, wgRenames)
 
 	return &Result{Root: map[string]any{"opnsense": opnsense}, Report: report}, nil
+}
+
+// dropPfSenseWireGuard removes the pfSense package block and its package
+// record once WireGuard has been mapped natively, so the output does not carry
+// a second, unreadable copy or tell the user to install a plugin.
+func dropPfSenseWireGuard(pfsense map[string]any) {
+	delete(pfsense, "wireguard")
+	installed := xmlutil.Map(pfsense["installedpackages"])
+	if installed == nil {
+		return
+	}
+	delete(installed, "wireguard")
+	kept := []any{}
+	for _, raw := range xmlutil.AsArray(installed["package"]) {
+		p := xmlutil.Map(raw)
+		name := strings.ToLower(firstNonEmpty(xmlutil.AsString(p["internal_name"]), xmlutil.AsString(p["name"])))
+		if name != "wireguard" {
+			kept = append(kept, raw)
+		}
+	}
+	if len(kept) == 0 {
+		delete(installed, "package")
+	} else {
+		installed["package"] = kept
+	}
 }
 
 func BuildComment(report Notes) string {
@@ -861,17 +899,181 @@ func mapOvpnProto(value any) string {
 	return "udp"
 }
 
+// ovpnDigests is the auth option list of the OPNsense OpenVPN Instance model,
+// keyed by its uppercase form so pfSense's casing can be matched.
+var ovpnDigests = func() map[string]string {
+	out := map[string]string{}
+	for _, name := range []string{
+		"BLAKE2b512", "BLAKE2s256", "MD4", "MD5", "MD5-SHA1", "RIPEMD160",
+		"SHA1", "SHA224", "SHA256", "SHA3-224", "SHA3-256", "SHA3-384",
+		"SHA3-512", "SHA384", "SHA512", "SHA512-224", "SHA512-256",
+		"SHAKE128", "SHAKE256", "whirlpool", "none",
+	} {
+		out[strings.ToUpper(name)] = name
+	}
+	return out
+}()
+
+// OvpnCiphers is the data-ciphers option list of the OPNsense OpenVPN Instance
+// model. Exported so the validator can check what the mapper emitted.
+var OvpnCiphers = func() map[string]string {
+	out := map[string]string{}
+	for _, name := range []string{
+		"AES-128-GCM", "AES-192-GCM", "AES-256-GCM", "CHACHA20-POLY1305",
+		"AES-128-CBC", "AES-192-CBC", "AES-256-CBC",
+		"AES-128-CFB", "AES-192-CFB", "AES-256-CFB",
+		"AES-128-CFB1", "AES-192-CFB1", "AES-256-CFB1",
+		"AES-128-CFB8", "AES-192-CFB8", "AES-256-CFB8",
+		"AES-128-OFB", "AES-192-OFB", "AES-256-OFB",
+	} {
+		out[name] = name
+	}
+	return out
+}()
+
 func mapOvpnDigest(value any) string {
 	digest := strings.TrimSpace(xmlutil.AsString(value))
 	if digest == "" {
 		return ""
 	}
-	upper := regexp.MustCompile(`[^A-Z0-9-]`).ReplaceAllString(strings.ToUpper(digest), "")
-	switch upper {
-	case "SHA1", "SHA256", "SHA512", "SHA384", "SHA224":
-		return upper
+	if known, ok := ovpnDigests[strings.ToUpper(digest)]; ok {
+		return known
 	}
 	return digest
+}
+
+// ovpnCipherList normalizes pfSense cipher names onto the OPNsense option list
+// and reports the ones with no match.
+func ovpnCipherList(in []string) (ciphers, unknown []string) {
+	for _, raw := range uniqueNonEmpty(in) {
+		if known, ok := OvpnCiphers[strings.ToUpper(raw)]; ok {
+			ciphers = append(ciphers, known)
+			continue
+		}
+		ciphers = append(ciphers, raw)
+		unknown = append(unknown, raw)
+	}
+	return unique(ciphers), unique(unknown)
+}
+
+// ovpnStrictUserCN maps the pfSense checkbox onto the OPNsense option list
+// (0 = no, 1 = yes, 2 = yes case insensitive).
+func ovpnStrictUserCN(value any) string {
+	switch v := xmlutil.LowerIdent(value); v {
+	case "0", "1", "2":
+		return v
+	case "":
+		return "0"
+	default:
+		return ifThen(xmlutil.FlagSet(value), "1", "0")
+	}
+}
+
+// ovpnRemote renders pfSense's separate host and port into the comma separated
+// host:port list RemoteHostField validates, bracketing bare IPv6 literals.
+func ovpnRemote(host, port any) string {
+	p := strings.TrimSpace(xmlutil.AsString(port))
+	out := []string{}
+	for _, entry := range uniqueNonEmpty(regexp.MustCompile(`[,\s]+`).Split(xmlutil.AsString(host), -1)) {
+		switch {
+		case p == "", strings.HasSuffix(entry, "]"), strings.Count(entry, ":") == 1:
+			out = append(out, entry)
+		case net.ParseIP(entry) != nil && strings.Contains(entry, ":"):
+			out = append(out, "["+entry+"]:"+p)
+		default:
+			out = append(out, entry+":"+p)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+// pfSense's openvpn defaults, from $openvpn_default_keepalive_{interval,timeout}.
+const (
+	ovpnKeepaliveInterval = 10
+	ovpnKeepaliveTimeout  = 60
+)
+
+// ovpnKeepalive returns the interval and timeout to write. OPNsense rejects the
+// instance unless timeout is at least twice the interval and both are set
+// together, so a lopsided pfSense pair is widened rather than dropped.
+func ovpnKeepalive(node map[string]any) (string, string, bool) {
+	// A custom ping action replaces keepalive entirely on pfSense; there is no
+	// OPNsense field for it, so do not invent one.
+	if xmlutil.AsString(node["ping_action"]) != "" {
+		return "", "", false
+	}
+	interval := ovpnKeepaliveInterval
+	if n, err := strconv.Atoi(strings.TrimSpace(xmlutil.AsString(node["keepalive_interval"]))); err == nil && n > 0 {
+		interval = n
+	}
+	timeout := ovpnKeepaliveTimeout
+	if n, err := strconv.Atoi(strings.TrimSpace(xmlutil.AsString(node["keepalive_timeout"]))); err == nil && n > 0 {
+		timeout = n
+	}
+	if timeout < interval*2 {
+		timeout = interval * 2
+	}
+	return strconv.Itoa(interval), strconv.Itoa(timeout), true
+}
+
+// joinNetworks flattens pfSense's numbered/paired network fields into the comma
+// separated list OPNsense AsList fields expect.
+func joinNetworks(values ...any) string {
+	out := []string{}
+	for _, value := range values {
+		out = append(out, xmlutil.SplitList(value)...)
+	}
+	return strings.Join(uniqueNonEmpty(out), ",")
+}
+
+// normalizeCIDR clears host bits for the Strict NetworkFields.
+func normalizeCIDR(value string) string {
+	value = strings.TrimSpace(value)
+	if !strings.Contains(value, "/") {
+		return value
+	}
+	_, ipnet, err := net.ParseCIDR(value)
+	if err != nil {
+		return value
+	}
+	return ipnet.String()
+}
+
+// vpnidPool hands out the unique, positive vpnid values the OPNsense
+// VPNIdField requires across every Instance. reserved holds ids another
+// instance still wants, so a renumbered one does not steal them.
+type vpnidPool struct {
+	reserved map[int]struct{}
+	issued   map[int]struct{}
+	next     int
+}
+
+func newVPNIDPool() *vpnidPool {
+	return &vpnidPool{reserved: map[int]struct{}{}, issued: map[int]struct{}{}, next: 1}
+}
+
+func (p *vpnidPool) reserve(raw string) {
+	if n, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && n >= 1 {
+		p.reserved[n] = struct{}{}
+	}
+}
+
+func (p *vpnidPool) take(raw string) string {
+	if n, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && n >= 1 {
+		if _, taken := p.issued[n]; !taken {
+			p.issued[n] = struct{}{}
+			return strconv.Itoa(n)
+		}
+	}
+	for {
+		_, isReserved := p.reserved[p.next]
+		_, isIssued := p.issued[p.next]
+		if !isReserved && !isIssued {
+			p.issued[p.next] = struct{}{}
+			return strconv.Itoa(p.next)
+		}
+		p.next++
+	}
 }
 
 func mapOpenVPN(pfsense map[string]any, opt *Options, report *Notes) map[string]any {
@@ -899,6 +1101,16 @@ func mapOpenVPN(pfsense map[string]any, opt *Options, report *Notes) map[string]
 	report.Stats.UserCerts = userCerts
 	if len(servers)+len(clients)+len(cscs) == 0 {
 		return nil
+	}
+
+	ifaces := xmlutil.Map(pfsense["interfaces"])
+
+	// pfSense numbers openvpn-server and openvpn-client separately, so a server
+	// and a client can share a vpnid. OPNsense keeps one Instances list and
+	// rejects duplicates, so reserve the server ids first and renumber clashes.
+	vpnids := newVPNIDPool()
+	for _, raw := range servers {
+		vpnids.reserve(xmlutil.AsString(xmlutil.Map(raw)["vpnid"]))
 	}
 
 	staticKeys := []any{}
@@ -929,18 +1141,29 @@ func mapOpenVPN(pfsense map[string]any, opt *Options, report *Notes) map[string]
 	mapInstance := func(raw any, role string) map[string]any {
 		node := xmlutil.Map(raw)
 		id := nextUUID(opt)
-		vpnid := orDefault(xmlutil.AsString(node["vpnid"]), fmt.Sprintf("%d", len(staticKeys)+1))
+		wanted := xmlutil.AsString(node["vpnid"])
+		vpnid := vpnids.take(wanted)
 		label := orDefault(xmlutil.AsString(orVal(node["description"], node["descr"])), fmt.Sprintf("OpenVPN %s %s", role, vpnid))
+		if wanted != "" && wanted != vpnid {
+			report.Notes = append(report.Notes, fmt.Sprintf(
+				`OpenVPN "%s" was renumbered from vpnid %s to %s; pfSense numbers servers and clients separately but OPNsense keeps one Instances list.`,
+				label, wanted, vpnid))
+		}
 		ncp := splitOvpnCiphers(orVal(node["ncp-ciphers"], node["ncp_ciphers"]))
 		named := splitOvpnCiphers(orVal(node["data-ciphers"], node["data_ciphers"]))
 		legacy := splitOvpnCiphers(node["crypto"])
-		ciphers := uniqueNonEmpty(append(append(ncp, named...), legacy...))
-		fallback := firstOvpnCipher(orVal(node["data-ciphers-fallback"], node["data_ciphers_fallback"]))
-		if fallback == "" && len(legacy) == 1 {
-			fallback = legacy[0]
+		ciphers, unknown := ovpnCipherList(append(append(ncp, named...), legacy...))
+		fallback, _ := ovpnCipherList([]string{firstOvpnCipher(orVal(node["data-ciphers-fallback"], node["data_ciphers_fallback"]))})
+		if len(fallback) == 0 && len(legacy) == 1 {
+			fallback, _ = ovpnCipherList(legacy)
 		}
-		if fallback == "" && len(ciphers) > 0 {
-			fallback = ciphers[0]
+		if len(fallback) == 0 && len(ciphers) > 0 {
+			fallback = ciphers[:1]
+		}
+		if len(unknown) > 0 {
+			report.Notes = append(report.Notes, fmt.Sprintf(
+				`OpenVPN "%s" used cipher(s) %s that are not in the OPNsense Instances list; they were kept but pick a supported cipher before saving the instance.`,
+				label, strings.Join(unknown, ", ")))
 		}
 		flags := []string{}
 		if xmlutil.YesFlag(node["client2client"]) {
@@ -976,27 +1199,53 @@ func mapOpenVPN(pfsense map[string]any, opt *Options, report *Notes) map[string]
 			"verify_client_cert":      "require",
 			"use_ocsp":                "0",
 			"username_as_common_name": xmlutil.Present01(node["username_as_common_name"]),
-			"strictusercn":            orDefault(xmlutil.AsString(node["strictusercn"]), "0"),
+			"strictusercn":            ovpnStrictUserCN(node["strictusercn"]),
 			"provision_exclusive":     "0",
 			"register_dns":            xmlutil.Present01(node["register_dns"]),
 		}
 		if port := xmlutil.AsString(orVal(node["local_port"], node["port"])); port != "" {
 			instance["port"] = port
 		}
-		if xmlutil.AsString(node["ipaddr"]) != "" {
-			instance["local"] = xmlutil.AsString(node["ipaddr"])
+		// OPNsense binds an instance with "local"; pfSense names an interface.
+		if local := firstNonEmpty(xmlutil.AsString(node["ipaddr"]), interfaceBindAddr(node["interface"], ifaces)); local != "" {
+			instance["local"] = local
 		}
+		// server / server_ipv6 are Strict NetworkFields: host bits are rejected.
 		if role == "server" && xmlutil.AsString(node["tunnel_network"]) != "" {
-			instance["server"] = xmlutil.AsString(node["tunnel_network"])
+			instance["server"] = normalizeCIDR(xmlutil.AsString(node["tunnel_network"]))
 		}
 		if role == "server" && xmlutil.AsString(node["tunnel_networkv6"]) != "" {
-			instance["server_ipv6"] = xmlutil.AsString(node["tunnel_networkv6"])
+			instance["server_ipv6"] = normalizeCIDR(xmlutil.AsString(node["tunnel_networkv6"]))
 		}
-		if xmlutil.AsString(node["local_network"]) != "" {
-			instance["push_route"] = xmlutil.AsString(node["local_network"])
+		if routes := joinNetworks(node["local_network"], node["local_networkv6"]); routes != "" {
+			instance["push_route"] = routes
 		}
-		if xmlutil.AsString(node["remote_network"]) != "" {
-			instance["route"] = xmlutil.AsString(node["remote_network"])
+		if routes := joinNetworks(node["remote_network"], node["remote_networkv6"]); routes != "" {
+			instance["route"] = routes
+		}
+		if dns := joinNetworks(node["dns_server1"], node["dns_server2"], node["dns_server3"], node["dns_server4"]); dns != "" {
+			instance["dns_servers"] = dns
+		}
+		if ntp := joinNetworks(node["ntp_server1"], node["ntp_server2"]); ntp != "" {
+			instance["ntp_servers"] = ntp
+		}
+		if domain := xmlutil.AsString(node["dns_domain"]); domain != "" {
+			instance["dns_domain"] = domain
+		}
+		if reneg := xmlutil.AsString(orVal(node["reneg-sec"], node["reneg_sec"])); reneg != "" {
+			instance["reneg-sec"] = reneg
+		}
+		// pfSense always writes "keepalive <interval> <timeout>" (10 60 by
+		// default) unless a custom ping action replaces it. OPNsense only
+		// writes the directive when both fields are set, so leaving them empty
+		// drops dead-peer detection and logs "--keepalive option is missing".
+		if interval, timeout, ok := ovpnKeepalive(node); ok {
+			instance["keepalive_interval"] = interval
+			instance["keepalive_timeout"] = timeout
+		} else if xmlutil.AsString(node["ping_action"]) != "" {
+			report.Notes = append(report.Notes, fmt.Sprintf(
+				`OpenVPN "%s" used a pfSense ping action instead of keepalive; OPNsense Instances have no equivalent, so keepalive was left unset. Set Keepalive interval/timeout under VPN → OpenVPN → Instances.`,
+				label))
 		}
 		if xmlutil.AsString(node["certref"]) != "" {
 			instance["cert"] = xmlutil.AsString(node["certref"])
@@ -1016,8 +1265,8 @@ func mapOpenVPN(pfsense map[string]any, opt *Options, report *Notes) map[string]
 		if len(ciphers) > 0 {
 			instance["data-ciphers"] = strings.Join(ciphers, ",")
 		}
-		if fallback != "" {
-			instance["data-ciphers-fallback"] = fallback
+		if len(fallback) > 0 {
+			instance["data-ciphers-fallback"] = fallback[0]
 		}
 		if tls := ensureKey(node, label); tls != "" {
 			instance["tls_key"] = tls
@@ -1035,14 +1284,10 @@ func mapOpenVPN(pfsense map[string]any, opt *Options, report *Notes) map[string]
 			instance["authmode"] = xmlutil.AsString(node["authmode"])
 		}
 		if role == "client" {
-			host := xmlutil.AsString(orVal(node["server_addr"], node["remote"]))
-			rport := xmlutil.AsString(orVal(node["server_port"], node["port"]))
-			if host != "" {
-				if rport != "" {
-					instance["remote"] = host + " " + rport
-				} else {
-					instance["remote"] = host
-				}
+			// RemoteHostField parses a comma separated list of host:port, so a
+			// space separated pair fails validation and the client never starts.
+			if remote := ovpnRemote(orVal(node["server_addr"], node["remote"]), orVal(node["server_port"], node["port"])); remote != "" {
+				instance["remote"] = remote
 			}
 		}
 		if strings.ToLower(xmlutil.AsString(node["dev_mode"])) == "tap" {
@@ -1250,4 +1495,8 @@ func firstOvpnCipher(value any) string {
 		return ""
 	}
 	return parts[0]
+}
+
+func revisionUnixTime() string {
+	return strconv.FormatFloat(float64(time.Now().UnixMilli())/1000, 'f', 4, 64)
 }

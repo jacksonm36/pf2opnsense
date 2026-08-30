@@ -3,7 +3,9 @@ package validate
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -73,6 +75,9 @@ func Run(ctx Context) Report {
 		checkVLANs(ctx),
 		checkTrust(ctx),
 		checkIPsec(ctx),
+		checkIPsecModel(ctx),
+		checkOpenVPNModel(ctx),
+		checkWireGuard(ctx),
 		checkPPPs(ctx),
 		checkSyslog(ctx),
 		checkCron(ctx),
@@ -232,6 +237,7 @@ func checkInterfaces(ctx Context) Check {
 	if withDev == 0 {
 		return fail("input-interfaces", "input", title, "Interfaces exist but none have a device or address.")
 	}
+	sort.Strings(names)
 	return pass("input-interfaces", "input", title, "Found "+strings.Join(names, ", ")+".")
 }
 
@@ -357,8 +363,7 @@ func checkAliases(ctx Context) Check {
 	}
 	for _, raw := range out {
 		content := xmlutil.AsString(xmlutil.Map(raw)["content"])
-		glued := regexp.MustCompile(`[0-9]\d+\.\d+\.\d+\.\d+[0-9]`).MatchString(strings.ReplaceAll(content, "\n", ""))
-		if glued && !strings.Contains(content, "\n") && strings.Count(content, ".") > 3 {
+		if gluedIPv4.MatchString(strings.ReplaceAll(content, "\n", " ")) {
 			return fail("output-aliases", "output", title, "Alias addresses look concatenated without separators.")
 		}
 	}
@@ -448,6 +453,9 @@ func sourceHasDHCP(src map[string]any) bool {
 	}
 	for _, cfg := range xmlutil.Map(src["dhcpd"]) {
 		m := xmlutil.Map(cfg)
+		if !xmlutil.FlagSet(m["enable"]) {
+			continue
+		}
 		if xmlutil.AsString(xmlutil.Get(m, "range", "from")) != "" && xmlutil.AsString(xmlutil.Get(m, "range", "to")) != "" {
 			return true
 		}
@@ -591,7 +599,7 @@ func checkTrust(ctx Context) Check {
 func checkIPsec(ctx Context) Check {
 	title := "IPsec Connections"
 	out := opnsense(ctx)
-	if xmlutil.Get(out, "OPNsense", "IPsec", "Swanctl") != nil {
+	if !xmlutil.IsEmptySection(xmlutil.Get(out, "OPNsense", "IPsec", "Swanctl")) {
 		return fail("output-ipsec", "output", title, "Swanctl is nested under OPNsense/IPsec/Swanctl. OPNsense 26.7 mounts it at OPNsense/Swanctl; run_migrations.php will drop the nested copy.")
 	}
 	legacy := xmlutil.Map(xmlutil.Get(out, "ipsec"))
@@ -631,6 +639,406 @@ func checkIPsec(ctx Context) Check {
 	return pass("output-ipsec", "output", title, fmt.Sprintf(
 		"%d Connection(s), %d child SA(s) (from %d phase2), %d pre-shared key(s) under VPN → IPsec → Connections (OPNsense/Swanctl).",
 		len(conns), len(children), phase2, len(psks)))
+}
+
+var (
+	ovpnRoles      = map[string]struct{}{"client": {}, "server": {}}
+	ovpnProtos     = map[string]struct{}{"udp": {}, "udp4": {}, "udp6": {}, "tcp": {}, "tcp4": {}, "tcp6": {}}
+	ovpnTopologies = map[string]struct{}{"net30": {}, "p2p": {}, "subnet": {}}
+	// RemoteHostField splits on ':' and runs the host through
+	// FILTER_VALIDATE_DOMAIN/FILTER_VALIDATE_IP, so a space separated
+	// "host port" pair (what pfSense stores in two fields) is rejected.
+	ovpnRemoteHostRe = regexp.MustCompile(`^(\[[0-9A-Fa-f:.]+\]|[0-9A-Za-z][0-9A-Za-z.\-]*)(:\d{1,5})?$`)
+)
+
+// checkOpenVPNModel validates the emitted Instances against the OPNsense
+// OpenVPN model. Duplicate vpnids and malformed remotes are rejected by the
+// model, so the instance silently never starts.
+func checkOpenVPNModel(ctx Context) Check {
+	title := "OpenVPN model conformance"
+	out := opnsense(ctx)
+	instances := xmlutil.AsArray(xmlutil.Get(out, "OPNsense", "OpenVPN", "Instances", "Instance"))
+	if len(instances) == 0 {
+		return skip("output-openvpn-model", "output", title, "No OpenVPN instances in the output.")
+	}
+
+	errors, warnings := []string{}, []string{}
+	// Legacy servers and MVC instances share one device namespace: both derive
+	// dev-node /dev/<dev_type><vpnid>, so an overlapping id means the second
+	// daemon dies with "Cannot open TUN/TAP dev: Device busy".
+	seenVPNID := map[string]string{}
+	legacy := xmlutil.Map(out["openvpn"])
+	for _, key := range []string{"openvpn-server", "openvpn-client"} {
+		for _, raw := range xmlutil.AsArray(legacy[key]) {
+			node := xmlutil.Map(raw)
+			if id := strings.TrimSpace(xmlutil.AsString(node["vpnid"])); id != "" {
+				descr := xmlutil.AsString(node["description"])
+				if descr == "" {
+					descr = xmlutil.AsString(node["descr"])
+				}
+				if n, err := strconv.Atoi(id); err == nil && n >= 1 {
+					id = strconv.Itoa(n)
+				}
+				seenVPNID[id] = ipsecLabel(descr, "legacy "+strings.TrimPrefix(key, "openvpn-"))
+			}
+		}
+	}
+	for _, raw := range instances {
+		inst := xmlutil.Map(raw)
+		label := ipsecLabel(inst["description"], "OpenVPN instance")
+		vpnid := strings.TrimSpace(xmlutil.AsString(inst["vpnid"]))
+		if n, err := strconv.Atoi(vpnid); err != nil || n < 1 {
+			errors = append(errors, fmt.Sprintf("%s has vpnid %q (must be a positive number)", label, vpnid))
+		} else if prev, dup := seenVPNID[strconv.Itoa(n)]; dup {
+			dev := strings.ToLower(xmlutil.AsString(inst["dev_type"]))
+			if dev == "" {
+				dev = "tun"
+			}
+			errors = append(errors, fmt.Sprintf(
+				"%s reuses vpnid %s, already taken by %s; both open /dev/%s%s and the second one fails with \"Device busy\"",
+				label, strconv.Itoa(n), prev, dev, strconv.Itoa(n)))
+		} else {
+			seenVPNID[strconv.Itoa(n)] = label
+		}
+		for _, host := range ovpnRemoteValues(inst["remote"]) {
+			if !ovpnRemoteHostRe.MatchString(host) {
+				errors = append(errors, fmt.Sprintf("%s remote %q is not a host:port pair", label, host))
+			}
+		}
+		for _, tc := range []struct {
+			field string
+			list  map[string]struct{}
+		}{{"role", ovpnRoles}, {"proto", ovpnProtos}, {"topology", ovpnTopologies}} {
+			v := strings.ToLower(xmlutil.AsString(inst[tc.field]))
+			if v == "" {
+				continue
+			}
+			if _, ok := tc.list[v]; !ok {
+				errors = append(errors, fmt.Sprintf("%s has %s %q, which OPNsense does not offer", label, tc.field, v))
+			}
+		}
+		for _, field := range []string{"server", "server_ipv6"} {
+			if hostBitsSet(xmlutil.AsString(inst[field])) {
+				warnings = append(warnings, fmt.Sprintf("%s %s %s has host bits set; the field is strict", label, field, xmlutil.AsString(inst[field])))
+			}
+		}
+		// OPNsense only writes --keepalive when both fields are set, and
+		// rejects the instance unless timeout is at least twice the interval.
+		interval, iOK := positiveInt(inst["keepalive_interval"])
+		timeout, tOK := positiveInt(inst["keepalive_timeout"])
+		switch {
+		case !iOK && !tOK:
+			warnings = append(warnings, fmt.Sprintf(
+				"%s has no keepalive; OpenVPN will log \"--keepalive option is missing\" and will not drop dead peers", label))
+		case iOK != tOK:
+			errors = append(errors, fmt.Sprintf("%s sets only one of keepalive_interval/keepalive_timeout; OPNsense needs both or neither", label))
+		case timeout < interval*2:
+			errors = append(errors, fmt.Sprintf("%s has keepalive timeout %d below twice the interval %d", label, timeout, interval))
+		}
+		for _, cipher := range strings.Split(xmlutil.AsString(inst["data-ciphers"]), ",") {
+			cipher = strings.TrimSpace(cipher)
+			if cipher == "" {
+				continue
+			}
+			if _, ok := mapper.OvpnCiphers[strings.ToUpper(cipher)]; !ok {
+				warnings = append(warnings, fmt.Sprintf("%s uses cipher %s, which is not in the OPNsense list", label, cipher))
+			}
+		}
+	}
+
+	if len(errors) > 0 {
+		return fail("output-openvpn-model", "output", title, strings.Join(unique(errors), "; ")+".")
+	}
+	if len(warnings) > 0 {
+		return warn("output-openvpn-model", "output", title, strings.Join(unique(warnings), "; ")+".")
+	}
+	return pass("output-openvpn-model", "output", title, fmt.Sprintf(
+		"%d Instance(s) match the OPNsense OpenVPN model (unique vpnids, valid role/proto/topology).", len(instances)))
+}
+
+// checkWireGuard confirms the pfSense WireGuard package landed in OPNsense's
+// built-in WireGuard model with the fields it marks Required.
+func checkWireGuard(ctx Context) Check {
+	title := "WireGuard"
+	out := opnsense(ctx)
+	src := xmlutil.Get(pfsense(ctx), "installedpackages", "wireguard")
+	if src == nil {
+		src = xmlutil.Get(pfsense(ctx), "wireguard")
+	}
+	srcTunnels := len(xmlutil.AsArray(xmlutil.Get(src, "tunnels", "item")))
+	srcPeers := len(xmlutil.AsArray(xmlutil.Get(src, "peers", "item")))
+
+	servers := xmlutil.AsArray(xmlutil.Get(out, "OPNsense", "wireguard", "server", "servers", "server"))
+	clients := xmlutil.AsArray(xmlutil.Get(out, "OPNsense", "wireguard", "client", "clients", "client"))
+	if srcTunnels+srcPeers == 0 && len(servers)+len(clients) == 0 {
+		return skip("output-wireguard", "output", title, "No WireGuard tunnels or peers in the source config.")
+	}
+	if xmlutil.Get(out, "installedpackages", "wireguard") != nil {
+		return fail("output-wireguard", "output", title,
+			"The pfSense WireGuard package block is still in the output. OPNsense reads WireGuard from OPNsense/wireguard.")
+	}
+
+	errors, warnings := []string{}, []string{}
+	peerNames := map[string]struct{}{}
+	serverNames := map[string]struct{}{}
+	instances := map[string]struct{}{}
+	clientUUIDs := map[string]struct{}{}
+	for _, raw := range clients {
+		c := xmlutil.Map(raw)
+		label := ipsecLabel(c["name"], "WireGuard peer")
+		clientUUIDs[xmlutil.AsString(c["@_uuid"])] = struct{}{}
+		if strings.TrimSpace(xmlutil.AsString(c["pubkey"])) == "" {
+			errors = append(errors, fmt.Sprintf("%s has no public key", label))
+		}
+		if strings.TrimSpace(xmlutil.AsString(c["tunneladdress"])) == "" {
+			errors = append(errors, fmt.Sprintf("%s has no allowed IPs", label))
+		}
+		errors = append(errors, wgNameProblems(label, xmlutil.AsString(c["name"]), peerNames)...)
+	}
+	for _, raw := range servers {
+		s := xmlutil.Map(raw)
+		label := ipsecLabel(s["name"], "WireGuard instance")
+		if strings.TrimSpace(xmlutil.AsString(s["privkey"])) == "" {
+			errors = append(errors, fmt.Sprintf("%s has no private key", label))
+		}
+		instance := xmlutil.AsString(s["instance"])
+		if n, err := strconv.Atoi(instance); err != nil || n < 0 {
+			errors = append(errors, fmt.Sprintf("%s has instance %q (must be zero or a positive number)", label, instance))
+		} else if _, dup := instances[instance]; dup {
+			errors = append(errors, fmt.Sprintf("%s reuses instance %s, so two tunnels would claim wg%s", label, instance, instance))
+		} else {
+			instances[instance] = struct{}{}
+		}
+		errors = append(errors, wgNameProblems(label, xmlutil.AsString(s["name"]), serverNames)...)
+		for _, peer := range strings.Split(xmlutil.AsString(s["peers"]), ",") {
+			peer = strings.TrimSpace(peer)
+			if peer == "" {
+				continue
+			}
+			if _, ok := clientUUIDs[peer]; !ok {
+				errors = append(errors, fmt.Sprintf("%s lists peer %s, which is not in the output", label, peer))
+			}
+		}
+		if strings.TrimSpace(xmlutil.AsString(s["tunneladdress"])) == "" {
+			warnings = append(warnings, fmt.Sprintf("%s has no tunnel address", label))
+		}
+	}
+	if srcTunnels > 0 && len(servers) == 0 {
+		return fail("output-wireguard", "output", title,
+			"pfSense WireGuard tunnels were not written to OPNsense/wireguard/server.")
+	}
+	if srcPeers > 0 && len(clients) == 0 {
+		return fail("output-wireguard", "output", title,
+			"pfSense WireGuard peers were not written to OPNsense/wireguard/client.")
+	}
+
+	if len(errors) > 0 {
+		return fail("output-wireguard", "output", title, strings.Join(unique(errors), "; ")+".")
+	}
+	if len(warnings) > 0 {
+		return warn("output-wireguard", "output", title, strings.Join(unique(warnings), "; ")+".")
+	}
+	return pass("output-wireguard", "output", title, fmt.Sprintf(
+		"%d instance(s) and %d peer(s) under VPN → WireGuard (OPNsense/wireguard); WireGuard is built into OPNsense %s.",
+		len(servers), len(clients), mapper.OpnTarget()))
+}
+
+func positiveInt(value any) (int, bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(xmlutil.AsString(value)))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+var wgNameRe = regexp.MustCompile(`^[0-9a-zA-Z._\-]{1,64}$`)
+
+func wgNameProblems(label, name string, seen map[string]struct{}) []string {
+	out := []string{}
+	if !wgNameRe.MatchString(name) {
+		out = append(out, fmt.Sprintf("%s has name %q (1-64 alphanumeric, dot, dash or underscore)", label, name))
+		return out
+	}
+	key := strings.ToLower(name)
+	if _, dup := seen[key]; dup {
+		out = append(out, fmt.Sprintf("%s reuses the name %q", label, name))
+	}
+	seen[key] = struct{}{}
+	return out
+}
+
+// strongSwan proposal keywords accepted by OPNsense's IPsecProposalField.
+var proposalTokenRe = regexp.MustCompile(`^(` +
+	`default|null|` +
+	`aes(128|192|256)?(gcm(8|12|16)|ccm(8|12|16)|ctr|gmac)?|` +
+	`3des|des|cast128|(blowfish|serpent|twofish)\d*|camellia\d*(gcm\d+)?|chacha20poly1305|` +
+	`sha1(_96|_160)?|sha256|sha384|sha512|sha2_(256|384|512)|md5(_96|_128)?|aesxcbc|aescmac|` +
+	`prf(sha1|sha256|sha384|sha512|md5|aesxcbc|aescmac)|` +
+	`modp\d+(s\d+)?|modpnone|ecp\d+(bp)?|curve25519|curve448|x25519|x448|none|noesn|esn|` +
+	`ke\d+_[a-z0-9_]+` +
+	`)$`)
+
+var gluedIPv4 = regexp.MustCompile(`\d{1,3}(?:\.\d{1,3}){3}\d{1,3}(?:\.\d{1,3}){3}`)
+
+var childModes = map[string]struct{}{"tunnel": {}, "transport": {}, "pass": {}, "drop": {}}
+var ikeVersions = map[string]struct{}{"0": {}, "1": {}, "2": {}}
+
+// checkIPsecModel validates the emitted Swanctl tree against the OPNsense
+// Swanctl model's option lists and relations. A malformed proposal or a child
+// pointing at a missing Connection loads into config.xml but never comes up.
+func checkIPsecModel(ctx Context) Check {
+	title := "IPsec model conformance"
+	out := opnsense(ctx)
+	conns := xmlutil.AsArray(xmlutil.Get(out, "OPNsense", "Swanctl", "Connections", "Connection"))
+	children := xmlutil.AsArray(xmlutil.Get(out, "OPNsense", "Swanctl", "children", "child"))
+	psks := xmlutil.AsArray(xmlutil.Get(out, "OPNsense", "IPsec", "preSharedKeys", "preSharedKey"))
+	if len(conns)+len(children)+len(psks) == 0 {
+		return skip("output-ipsec-model", "output", title, "No IPsec connections, child SAs or pre-shared keys in the output.")
+	}
+
+	errors, warnings := []string{}, []string{}
+	connUUIDs := map[string]struct{}{}
+	for _, raw := range conns {
+		c := xmlutil.Map(raw)
+		label := ipsecLabel(c["description"], "Connection")
+		if id := xmlutil.AsString(c["@_uuid"]); id != "" {
+			connUUIDs[id] = struct{}{}
+		}
+		if bad, unknown := classifyProposalTokens(xmlutil.AsString(c["proposals"])); len(bad) > 0 {
+			errors = append(errors, fmt.Sprintf("%s has invalid IKE proposal token(s) %s", label, strings.Join(bad, ", ")))
+		} else if len(unknown) > 0 {
+			warnings = append(warnings, fmt.Sprintf("%s has unrecognized IKE proposal token(s) %s", label, strings.Join(unknown, ", ")))
+		}
+		if v := xmlutil.AsString(c["version"]); v != "" {
+			if _, ok := ikeVersions[v]; !ok {
+				warnings = append(warnings, fmt.Sprintf("%s has IKE version %q (expected 0, 1 or 2)", label, v))
+			}
+		}
+	}
+	for _, raw := range children {
+		c := xmlutil.Map(raw)
+		label := ipsecLabel(c["description"], "Child SA")
+		if bad, unknown := classifyProposalTokens(xmlutil.AsString(c["esp_proposals"])); len(bad) > 0 {
+			errors = append(errors, fmt.Sprintf("%s has invalid ESP proposal token(s) %s", label, strings.Join(bad, ", ")))
+		} else if len(unknown) > 0 {
+			warnings = append(warnings, fmt.Sprintf("%s has unrecognized ESP proposal token(s) %s", label, strings.Join(unknown, ", ")))
+		}
+		parent := xmlutil.AsString(c["connection"])
+		if parent != "" {
+			if _, ok := connUUIDs[parent]; !ok {
+				errors = append(errors, fmt.Sprintf("%s points at Connection %s, which is not in the output", label, parent))
+			}
+		}
+		if m := strings.ToLower(xmlutil.AsString(c["mode"])); m != "" {
+			if _, ok := childModes[m]; !ok {
+				errors = append(errors, fmt.Sprintf("%s has mode %q (OPNsense offers tunnel, transport, pass, drop)", label, m))
+			}
+		}
+		for _, field := range []string{"local_ts", "remote_ts"} {
+			for _, ts := range strings.Split(xmlutil.AsString(c[field]), ",") {
+				if hostBitsSet(ts) {
+					warnings = append(warnings, fmt.Sprintf("%s %s %s has host bits set", label, field, strings.TrimSpace(ts)))
+				}
+			}
+		}
+	}
+	for _, raw := range psks {
+		p := xmlutil.Map(raw)
+		if strings.TrimSpace(xmlutil.AsString(p["ident"])) == "" {
+			warnings = append(warnings, fmt.Sprintf(
+				"%s has no local identifier; OPNsense writes an empty id-0 into swanctl secrets and the key will not match",
+				ipsecLabel(p["description"], "Pre-shared key")))
+		}
+	}
+
+	if len(errors) > 0 {
+		return fail("output-ipsec-model", "output", title, strings.Join(unique(errors), "; ")+".")
+	}
+	if len(warnings) > 0 {
+		return warn("output-ipsec-model", "output", title, strings.Join(unique(warnings), "; ")+".")
+	}
+	return pass("output-ipsec-model", "output", title, fmt.Sprintf(
+		"%d Connection(s), %d child SA(s) and %d pre-shared key(s) match the OPNsense Swanctl model.",
+		len(conns), len(children), len(psks)))
+}
+
+func ipsecLabel(descr any, fallback string) string {
+	if s := strings.TrimSpace(xmlutil.AsString(descr)); s != "" {
+		return fmt.Sprintf("%s %q", fallback, s)
+	}
+	return fallback
+}
+
+func classifyProposalTokens(proposals string) (bad, unknown []string) {
+	for _, proposal := range strings.Split(proposals, ",") {
+		proposal = strings.TrimSpace(strings.ToLower(proposal))
+		if proposal == "" {
+			continue
+		}
+		for _, token := range strings.Split(proposal, "-") {
+			if token == "" || proposalTokenRe.MatchString(token) {
+				continue
+			}
+			if strings.Contains(token, "auto") || !keywordish.MatchString(token) {
+				bad = append(bad, token)
+			} else {
+				unknown = append(unknown, token)
+			}
+		}
+	}
+	return unique(bad), unique(unknown)
+}
+
+var keywordish = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+func ovpnRemoteValues(value any) []string {
+	raw := []string{}
+	switch t := value.(type) {
+	case []any:
+		for _, item := range t {
+			if s := strings.TrimSpace(xmlutil.AsString(item)); s != "" {
+				raw = append(raw, s)
+			}
+		}
+	default:
+		if s := strings.TrimSpace(xmlutil.AsString(value)); s != "" {
+			raw = append(raw, s)
+		}
+	}
+	out := []string{}
+	for _, s := range raw {
+		for _, host := range strings.Split(s, ",") {
+			if h := strings.TrimSpace(host); h != "" {
+				out = append(out, h)
+			}
+		}
+	}
+	return out
+}
+
+func unique(in []string) []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+func hostBitsSet(cidr string) bool {
+	cidr = strings.TrimSpace(cidr)
+	if !strings.Contains(cidr, "/") {
+		return false
+	}
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
+	}
+	return !ip.Equal(ipnet.IP)
 }
 
 func countPfSenseIPsec(in map[string]any) (p1, p2, mobile int) {
@@ -738,7 +1146,7 @@ func checkCron(ctx Context) Check {
 	jobs := xmlutil.AsArray(xmlutil.Get(opnsense(ctx), "OPNsense", "cron", "jobs", "job"))
 	kept, omitted := 0, 0
 	for _, raw := range in {
-		action, reason := mapper.ClassifyCron(xmlutil.AsString(xmlutil.Map(raw)["command"]))
+		action, _, reason := mapper.ClassifyCron(xmlutil.AsString(xmlutil.Map(raw)["command"]))
 		if action != "" && reason == "" {
 			kept++
 		} else {
@@ -772,7 +1180,7 @@ func checkDynDNS(ctx Context) Check {
 	if len(in) == 0 {
 		return skip("output-dyndns", "output", title, "No DynDNS accounts in the source config.")
 	}
-	if xmlutil.Get(opnsense(ctx), "dyndnses") != nil {
+	if !xmlutil.IsEmptySection(xmlutil.Get(opnsense(ctx), "dyndnses")) {
 		return fail("output-dyndns", "output", title, "Legacy <dyndnses> was dumped. OPNsense 26.7 expects OPNsense/DynDNS (os-ddclient).")
 	}
 	accounts := xmlutil.AsArray(xmlutil.Get(opnsense(ctx), "OPNsense", "DynDNS", "accounts", "account"))

@@ -2,7 +2,9 @@ package mapper
 
 import (
 	"fmt"
+	"net"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/jacksonm36/pf2opnsense/internal/xmlutil"
@@ -28,8 +30,12 @@ func mapIPsec(pfsense map[string]any, opt *Options, report *Notes) (ipsec, swanc
 	if len(phase1s)+len(mobile) == 0 {
 		return nil, nil
 	}
+	ifaces := xmlutil.Map(pfsense["interfaces"])
 
 	ikeToUUID := map[string]string{}
+	reservedIke := reservedIkeIDs(phase1s)
+	claimedIke := map[string]struct{}{}
+	responderOnly := map[string]bool{}
 	connections := []any{}
 	locals := []any{}
 	remotes := []any{}
@@ -40,29 +46,40 @@ func mapIPsec(pfsense map[string]any, opt *Options, report *Notes) (ipsec, swanc
 
 	for _, raw := range phase1s {
 		p1 := xmlutil.Map(raw)
-		ikeid := orDefault(xmlutil.AsString(p1["ikeid"]), fmt.Sprintf("%d", len(connections)+1))
+		ikeid := nextIkeID(xmlutil.AsString(p1["ikeid"]), reservedIke, claimedIke)
 		connUUID := nextUUID(opt)
 		ikeToUUID[ikeid] = connUUID
+		responderOnly[ikeid] = xmlutil.FlagSet(p1["responderonly"])
 		descr := orDefault(xmlutil.AsString(p1["descr"]), "IKE "+ikeid)
 		remoteGW := xmlutil.AsString(p1["remote-gateway"])
 		auth := strings.ToLower(xmlutil.AsString(p1["authentication_method"]))
+		localAddr := interfaceBindAddr(p1["interface"], ifaces)
+		proposals := p1Proposals(p1)
 
 		conn := map[string]any{
 			"@_uuid":       connUUID,
 			"enabled":      ifThen(xmlutil.FlagSet(p1["disabled"]), "0", "1"),
-			"proposals":    p1Proposals(p1),
+			"proposals":    proposals,
 			"unique":       "no",
-			"aggressive":   ifThen(strings.ToLower(xmlutil.AsString(p1["mode"])) == "aggressive", "1", "0"),
+			"aggressive":   ifThen(xmlutil.LowerIdent(p1["mode"]) == "aggressive", "1", "0"),
 			"version":      ikeVersion(p1["iketype"]),
-			"mobike":       xmlutil.Present01(orVal(p1["mobike"], "1")),
+			"mobike":       mobikeFlag(p1["mobike"]),
+			"local_addrs":  localAddr,
 			"remote_addrs": remoteGW,
-			"encap":        ifThen(strings.ToLower(xmlutil.AsString(p1["nat_traversal"])) == "off", "0", "1"),
+			// OPNsense encap means "force UDP encapsulation"; pfSense "on" only auto-detects NAT.
+			"encap":        ifThen(strings.EqualFold(xmlutil.AsString(p1["nat_traversal"]), "force"), "1", "0"),
 			"rekey_time":   xmlutil.AsString(p1["lifetime"]),
-			"dpd_delay":    xmlutil.AsString(p1["dpd_delay"]),
+			"dpd_delay":    validPositiveInt(p1["dpd_delay"]),
+			"dpd_timeout":  dpdTimeout(p1["dpd_delay"], p1["dpd_maxfail"]),
 			"send_certreq": "1",
 			"description":  descr,
 		}
 		connections = append(connections, conn)
+		if weakProposal(proposals) {
+			report.Notes = append(report.Notes, fmt.Sprintf(
+				`IPsec connection "%s" imported with IKE proposal %s. SHA-1 and/or DH ≤ modp2048 are weak on OPNsense %s; coordinate an upgrade (e.g. aes256-sha256-modp3072) with the remote peer.`,
+				descr, proposals, OpnTarget()))
+		}
 
 		localID := identValue(p1["myid_type"], p1["myid_data"], "")
 		remoteID := identValue(p1["peerid_type"], p1["peerid_data"], remoteGW)
@@ -103,9 +120,17 @@ func mapIPsec(pfsense map[string]any, opt *Options, report *Notes) (ipsec, swanc
 		if authKind == "psk" {
 			psk := xmlutil.AsString(p1["pre-shared-key"])
 			if psk != "" {
+				// OPNsense writes "id-0 = <ident>" into swanctl secrets, so an empty
+				// ident silently produces a key strongSwan can never match.
+				ident := pskIdent(localID, localAddr)
+				if ident == "" {
+					report.Notes = append(report.Notes, fmt.Sprintf(
+						`IPsec pre-shared key for "%s" has no local identifier (pfSense used "My IP address" on a dynamic WAN). Set the local identifier under VPN → IPsec → Pre-Shared Keys before the tunnel will authenticate.`,
+						descr))
+				}
 				psks = append(psks, map[string]any{
 					"@_uuid":       nextUUID(opt),
-					"ident":        localID,
+					"ident":        ident,
 					"remote_ident": orDefault(remoteID, remoteGW),
 					"keyType":      "PSK",
 					"Key":          psk,
@@ -115,7 +140,6 @@ func mapIPsec(pfsense map[string]any, opt *Options, report *Notes) (ipsec, swanc
 		}
 	}
 
-	ifaces := xmlutil.Map(pfsense["interfaces"])
 	for _, raw := range phase2s {
 		p2 := xmlutil.Map(raw)
 		ikeid := xmlutil.AsString(p2["ikeid"])
@@ -126,26 +150,44 @@ func mapIPsec(pfsense map[string]any, opt *Options, report *Notes) (ipsec, swanc
 		childUUID := nextUUID(opt)
 		descr := orDefault(xmlutil.AsString(p2["descr"]), "Child "+xmlutil.AsString(p2["uniqid"]))
 		esp := p2Proposals(p2)
+		rawMode := xmlutil.LowerIdent(p2["mode"])
+		mode := childMode(rawMode)
+		reqid := childReqid(p2["reqid"])
+		if raw := strings.TrimSpace(xmlutil.AsString(p2["reqid"])); raw != "" && reqid == "" {
+			report.Notes = append(report.Notes, fmt.Sprintf(
+				`IPsec child "%s" had reqid %q, which is outside 1–65535 and was dropped.`,
+				descr, raw))
+		}
 		child := map[string]any{
 			"@_uuid":        childUUID,
 			"enabled":       ifThen(xmlutil.FlagSet(p2["disabled"]), "0", "1"),
 			"connection":    parent,
-			"reqid":         xmlutil.AsString(p2["reqid"]),
+			"reqid":         reqid,
 			"esp_proposals": esp,
 			"sha256_96":     "0",
-			"start_action":  "start",
+			"start_action":  ifThen(responderOnly[ikeid], "none", "start"),
 			"close_action":  "none",
 			"dpd_action":    "clear",
-			"mode":          orDefault(xmlutil.AsString(p2["mode"]), "tunnel"),
-			"policies":      "1",
-			"local_ts":      trafficSelector(p2["localid"], ifaces),
-			"remote_ts":     trafficSelector(p2["remoteid"], ifaces),
+			"mode":          mode,
+			"policies":      ifThen(rawMode == "vti", "0", "1"),
+			"local_ts":      trafficSelector(p2["localid"], ifaces, rawMode),
+			"remote_ts":     trafficSelector(p2["remoteid"], ifaces, rawMode),
 			"rekey_time":    xmlutil.AsString(p2["lifetime"]),
 			"description":   descr,
 		}
-		if weakESP(esp) {
+		if weakProposal(esp) {
 			report.Notes = append(report.Notes, fmt.Sprintf(
-				`IPsec child "%s" imported with ESP %s. SHA-1 and/or DH ≤ modp2048 are weak on OPNsense 26.7; coordinate an upgrade (e.g. aes256-sha256-modp3072) with the remote peer.`,
+				`IPsec child "%s" imported with ESP %s. SHA-1 and/or DH ≤ modp2048 are weak on OPNsense %s; coordinate an upgrade (e.g. aes256-sha256-modp3072) with the remote peer.`,
+				descr, esp, OpnTarget()))
+		}
+		if rawMode != "" && rawMode != mode {
+			report.Notes = append(report.Notes, fmt.Sprintf(
+				`IPsec child "%s" used pfSense mode "%s", which OPNsense does not offer; it was imported as "%s". Route-based (VTI) tunnels need a VTI entry under VPN → IPsec → Virtual Tunnel Interfaces.`,
+				descr, rawMode, mode))
+		}
+		if proto := xmlutil.LowerIdent(p2["protocol"]); proto == "ah" {
+			report.Notes = append(report.Notes, fmt.Sprintf(
+				`IPsec child "%s" used AH. OPNsense child SAs only carry ESP proposals, so it was imported as ESP %s; rebuild it as an AH tunnel if the peer requires AH.`,
 				descr, esp))
 		}
 		children = append(children, child)
@@ -178,12 +220,14 @@ func mapIPsec(pfsense map[string]any, opt *Options, report *Notes) (ipsec, swanc
 	if certNotes > 0 {
 		report.Notes = append(report.Notes, "One or more IPsec tunnels use certificates. Assign the local/remote certs under VPN → IPsec → Connections after import (OPNsense stores them as IPsec key pairs).")
 	}
-	if xmlutil.Map(src["client"]) != nil && len(connections) == 0 && len(mobile) > 0 {
-		report.Notes = append(report.Notes, "Mobile IPsec (road warrior) PSKs were copied. Recreate the mobile connection itself under VPN → IPsec → Connections.")
+	if dropped := droppedMobilePhase1(src); dropped > 0 {
+		report.Notes = append(report.Notes, fmt.Sprintf(
+			"%d mobile/road-warrior IPsec phase 1(s) were not mapped (no remote-gateway). Recreate them under VPN → IPsec → Connections. %d mobile PSK(s) were copied.",
+			dropped, len(mobile)))
 	}
 
 	ipsec = map[string]any{
-		"general": map[string]any{"enabled": "1"},
+		"general": map[string]any{"enabled": xmlutil.Present01(xmlutil.FlagSet(src["enable"]))},
 	}
 	if len(psks) > 0 {
 		ipsec["preSharedKeys"] = map[string]any{"preSharedKey": psks}
@@ -223,6 +267,55 @@ func usablePhase1(src map[string]any) []any {
 	return out
 }
 
+func droppedMobilePhase1(src map[string]any) int {
+	n := 0
+	for _, raw := range xmlutil.AsArray(src["phase1"]) {
+		if xmlutil.AsString(xmlutil.Map(raw)["remote-gateway"]) == "" {
+			n++
+		}
+	}
+	return n
+}
+
+func reservedIkeIDs(phase1s []any) map[string]struct{} {
+	used := map[string]struct{}{}
+	for _, raw := range phase1s {
+		if id := strings.TrimSpace(xmlutil.AsString(xmlutil.Map(raw)["ikeid"])); id != "" {
+			used[id] = struct{}{}
+		}
+	}
+	return used
+}
+
+func nextIkeID(raw string, reserved, claimed map[string]struct{}) string {
+	id := strings.TrimSpace(raw)
+	if id != "" {
+		if _, taken := claimed[id]; !taken {
+			claimed[id] = struct{}{}
+			return id
+		}
+	}
+	for n := 1; ; n++ {
+		cand := strconv.Itoa(n)
+		if _, taken := claimed[cand]; taken {
+			continue
+		}
+		if _, later := reserved[cand]; later {
+			continue
+		}
+		claimed[cand] = struct{}{}
+		return cand
+	}
+}
+
+func validPositiveInt(value any) string {
+	n, err := strconv.Atoi(strings.TrimSpace(xmlutil.AsString(value)))
+	if err != nil || n <= 0 {
+		return ""
+	}
+	return strconv.Itoa(n)
+}
+
 func usableMobileKeys(src map[string]any) []any {
 	out := []any{}
 	for _, raw := range xmlutil.AsArray(src["mobilekey"]) {
@@ -234,15 +327,102 @@ func usableMobileKeys(src map[string]any) []any {
 	return out
 }
 
+// ikeVersion maps pfSense iketype onto the OPNsense Connection option list:
+// 0 = IKEv1+IKEv2, 1 = IKEv1, 2 = IKEv2.
 func ikeVersion(value any) string {
-	v := strings.ToLower(xmlutil.AsString(value))
-	if strings.Contains(v, "ikev2") || v == "ikev2" {
+	switch v := xmlutil.LowerIdent(value); v {
+	case "ikev2":
 		return "2"
-	}
-	if strings.Contains(v, "ikev1") {
+	case "ikev1":
 		return "1"
+	case "auto", "":
+		return "0"
+	default:
+		if strings.Contains(v, "ikev2") {
+			return "2"
+		}
+		if strings.Contains(v, "ikev1") {
+			return "1"
+		}
+		return "0"
 	}
-	return "2"
+}
+
+// mobikeFlag reads the pfSense on/off string. Anything but an explicit "off"
+// keeps MOBIKE on, which is also the OPNsense default.
+func mobikeFlag(value any) string {
+	if strings.EqualFold(strings.TrimSpace(xmlutil.AsString(value)), "off") {
+		return "0"
+	}
+	return "1"
+}
+
+func dpdTimeout(delay, maxfail any) string {
+	d, err := strconv.Atoi(strings.TrimSpace(xmlutil.AsString(delay)))
+	if err != nil || d <= 0 {
+		return ""
+	}
+	f, err := strconv.Atoi(strings.TrimSpace(xmlutil.AsString(maxfail)))
+	if err != nil || f <= 0 {
+		return ""
+	}
+	timeout := d * (f + 1)
+	if timeout > 500000 {
+		timeout = 500000
+	}
+	return strconv.Itoa(timeout)
+}
+
+// childMode collapses pfSense phase 2 modes onto the OPNsense option list
+// (tunnel, transport, pass, drop).
+func childMode(mode string) string {
+	switch mode {
+	case "transport":
+		return "transport"
+	case "", "tunnel", "tunnel6":
+		return "tunnel"
+	default: // vti / route-based
+		return "tunnel"
+	}
+}
+
+func childReqid(value any) string {
+	n, err := strconv.Atoi(strings.TrimSpace(xmlutil.AsString(value)))
+	if err != nil || n < 1 || n > 65535 {
+		return ""
+	}
+	return strconv.Itoa(n)
+}
+
+// interfaceBindAddr resolves a pfSense interface reference (as used by IPsec
+// phase 1 and OpenVPN instances) to a literal address. Dynamic interfaces are
+// left blank so the daemon falls back to binding on any address.
+func interfaceBindAddr(value any, ifaces map[string]any) string {
+	key := xmlutil.LowerIdent(value)
+	if key == "" || key == "any" {
+		return ""
+	}
+	if net.ParseIP(key) != nil {
+		return key
+	}
+	iface := xmlutil.Map(ifaces[key])
+	if iface == nil {
+		return ""
+	}
+	if ip := strings.TrimSpace(xmlutil.AsString(iface["ipaddr"])); net.ParseIP(ip) != nil {
+		return ip
+	}
+	if ip := strings.TrimSpace(xmlutil.AsString(iface["ipaddrv6"])); net.ParseIP(ip) != nil {
+		return ip
+	}
+	return ""
+}
+
+func pskIdent(localID, localAddr string) string {
+	if localID != "" {
+		return localID
+	}
+	return localAddr
 }
 
 func identValue(typ, data any, fallback string) string {
@@ -262,20 +442,17 @@ func p1Proposals(p1 map[string]any) string {
 	hash := p1["hash-algorithm"]
 	dh := p1["dhgroup"]
 	if len(items) == 0 {
-		p := oneProposal(p1["encryption-algorithm"], hash, dh)
-		if p == "" {
+		parts := oneProposal(p1["encryption-algorithm"], hash, dh)
+		if len(parts) == 0 {
 			return "aes256-sha256-modp2048"
 		}
-		return p
+		return strings.Join(unique(parts), ",")
 	}
 	parts := []string{}
 	for _, raw := range items {
 		m := xmlutil.Map(raw)
 		enc := orVal(m["encryption-algorithm"], m)
-		p := oneProposal(enc, orVal(m["hash-algorithm"], hash), orVal(m["dhgroup"], dh))
-		if p != "" {
-			parts = append(parts, p)
-		}
+		parts = append(parts, oneProposal(enc, orVal(m["hash-algorithm"], hash), orVal(m["dhgroup"], dh))...)
 	}
 	if len(parts) == 0 {
 		return "aes256-sha256-modp2048"
@@ -287,11 +464,9 @@ func p2Proposals(p2 map[string]any) string {
 	encs := []string{}
 	for _, raw := range xmlutil.AsArray(p2["encryption-algorithm-option"]) {
 		if m := xmlutil.Map(raw); m != nil {
-			if tok := encToken(xmlutil.AsString(m["name"]), xmlutil.AsString(m["keylen"])); tok != "" {
-				encs = append(encs, tok)
-			}
+			encs = append(encs, encTokens(xmlutil.AsString(m["name"]), xmlutil.AsString(m["keylen"]))...)
 		} else if s := xmlutil.AsString(raw); s != "" {
-			encs = append(encs, encToken(s, ""))
+			encs = append(encs, encTokens(s, "")...)
 		}
 	}
 	hashes := []string{}
@@ -309,6 +484,14 @@ func p2Proposals(p2 map[string]any) string {
 	}
 	parts := []string{}
 	for _, enc := range encs {
+		if isAEAD(enc) {
+			p := enc
+			if dh != "" {
+				p += "-" + dh
+			}
+			parts = append(parts, p)
+			continue
+		}
 		for _, h := range hashes {
 			p := enc + "-" + h
 			if dh != "" {
@@ -320,7 +503,7 @@ func p2Proposals(p2 map[string]any) string {
 	return strings.Join(unique(parts), ",")
 }
 
-func oneProposal(enc, hash, dh any) string {
+func oneProposal(enc, hash, dh any) []string {
 	var name, keylen string
 	if m := xmlutil.Map(enc); m != nil {
 		name = xmlutil.AsString(orVal(m["name"], m["encryption-algorithm"]))
@@ -333,32 +516,78 @@ func oneProposal(enc, hash, dh any) string {
 	} else {
 		name = xmlutil.AsString(enc)
 	}
-	tok := encToken(name, keylen)
-	if tok == "" {
-		return ""
-	}
 	h := cleanHash(xmlutil.AsString(hash))
 	d := mapDH(xmlutil.AsString(dh))
-	p := tok
-	if h != "" && !strings.Contains(tok, "gcm") {
-		p += "-" + h
-	} else if h != "" && strings.Contains(tok, "gcm") {
-		p += "-" + h
+	out := []string{}
+	for _, tok := range encTokens(name, keylen) {
+		p := tok
+		if h != "" && !isAEAD(tok) {
+			p += "-" + h
+		}
+		if d != "" {
+			p += "-" + d
+		}
+		out = append(out, p)
 	}
-	if d != "" {
-		p += "-" + d
-	}
-	return p
+	return out
 }
 
-func encToken(name, keylen string) string {
+var (
+	digitRe     = regexp.MustCompile(`\d`)
+	icvSuffixRe = regexp.MustCompile(`(gcm|ccm|gmac)(8|12|16)$`)
+)
+
+// autoKeyLengths mirrors OPNsense's ipsec_p2_ealgos(): a pfSense keylen of
+// "auto" offers every key size the cipher supports.
+var autoKeyLengths = map[string][]string{"aes": {"128", "192", "256"}}
+
+// encTokens builds strongSwan cipher tokens. A non-numeric key length such as
+// pfSense's "auto" must never be pasted onto the name ("aesauto" is not a
+// cipher and OPNsense rejects the whole proposal).
+func encTokens(name, keylen string) []string {
 	name = strings.ToLower(strings.TrimSpace(name))
-	keylen = strings.TrimSpace(keylen)
+	keylen = strings.ToLower(strings.TrimSpace(keylen))
 	if name == "" {
-		return ""
+		return nil
 	}
-	if keylen != "" && !regexp.MustCompile(`\d`).MatchString(name) {
-		return name + keylen
+	if isAEAD(name) {
+		return []string{aeadToken(name, keylen)}
+	}
+	if keylen == "" || digitRe.MatchString(name) {
+		return []string{name}
+	}
+	if _, err := strconv.Atoi(keylen); err == nil {
+		return []string{name + keylen}
+	}
+	if sizes, ok := autoKeyLengths[name]; ok {
+		out := make([]string, 0, len(sizes))
+		for _, size := range sizes {
+			out = append(out, name+size)
+		}
+		return out
+	}
+	return []string{name}
+}
+
+func isAEAD(token string) bool {
+	t := strings.ToLower(token)
+	return strings.Contains(t, "gcm") || strings.Contains(t, "ccm") || strings.Contains(t, "chacha20poly1305")
+}
+
+// aeadToken maps pfSense GCM/CCM + ICV bits onto strongSwan names
+// (aes256gcm8 / aes256gcm12 / aes256gcm16). A missing ICV keeps the
+// name as-is, which strongSwan treats as ICV-16.
+func aeadToken(name, keylen string) string {
+	if icvSuffixRe.MatchString(name) {
+		return name
+	}
+	switch keylen {
+	case "64":
+		return name + "8"
+	case "96":
+		return name + "12"
+	case "128":
+		return name + "16"
 	}
 	return name
 }
@@ -381,42 +610,66 @@ func mapDH(v string) string {
 	return v
 }
 
-func trafficSelector(id any, ifaces map[string]any) string {
+// trafficSelector mirrors OPNsense's ipsec_idinfo_to_cidr: an interface-typed
+// selector means that interface's network, not its own address.
+func trafficSelector(id any, ifaces map[string]any, mode string) string {
 	m := xmlutil.Map(id)
 	if m == nil {
 		return ""
 	}
 	typ := xmlutil.LowerIdent(m["type"])
-	addr := xmlutil.AsString(m["address"])
-	bits := xmlutil.AsString(m["netbits"])
-	if typ == "network" || typ == "address" {
+	addr := strings.TrimSpace(xmlutil.AsString(m["address"]))
+	bits := strings.TrimSpace(xmlutil.AsString(m["netbits"]))
+	switch typ {
+	case "address":
+		return addr
+	case "network":
 		if addr == "" {
 			return ""
 		}
-		if bits != "" && !strings.Contains(addr, "/") {
-			return addr + "/" + bits
+		if bits == "" || strings.Contains(addr, "/") {
+			return addr
 		}
-		return addr
-	}
-	if typ == "none" || typ == "" {
+		return networkCIDR(addr, bits)
+	case "none", "mobile":
+		return ifThen(mode == "tunnel6", "::/0", "0.0.0.0/0")
+	case "":
 		return ""
 	}
 	iface := xmlutil.Map(ifaces[typ])
 	if iface == nil {
 		return ""
 	}
-	ip := xmlutil.AsString(iface["ipaddr"])
-	mask := xmlutil.AsString(iface["subnet"])
-	if ip == "" || mask == "" || ip == "dhcp" {
+	ipKey, maskKey := "ipaddr", "subnet"
+	if mode == "tunnel6" {
+		ipKey, maskKey = "ipaddrv6", "subnetv6"
+	}
+	ip := strings.TrimSpace(xmlutil.AsString(iface[ipKey]))
+	mask := strings.TrimSpace(xmlutil.AsString(iface[maskKey]))
+	if ip == "" || mask == "" || net.ParseIP(ip) == nil {
 		return ""
 	}
-	return ip + "/" + mask
+	return networkCIDR(ip, mask)
 }
 
-func weakESP(esp string) bool {
-	s := strings.ToLower(esp)
-	sha1 := regexp.MustCompile(`(^|-)sha1($|-)`).MatchString(s)
+// networkCIDR clears the host bits so "192.168.1.1" + "24" becomes
+// "192.168.1.0/24" rather than a selector with a host address in it.
+func networkCIDR(addr, bits string) string {
+	cidr := addr + "/" + bits
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return ""
+	}
+	return ipnet.String()
+}
+
+var sha1Re = regexp.MustCompile(`(^|-)sha1($|-)`)
+
+func weakProposal(proposal string) bool {
+	s := strings.ToLower(proposal)
 	weakDH := strings.Contains(s, "modp768") || strings.Contains(s, "modp1024") ||
 		strings.Contains(s, "modp1536") || strings.Contains(s, "modp2048")
-	return sha1 || weakDH
+	weakHash := sha1Re.MatchString(s) || strings.Contains(s, "md5") ||
+		strings.Contains(s, "-des-") || strings.HasPrefix(s, "des-") || strings.Contains(s, "3des")
+	return weakHash || weakDH
 }

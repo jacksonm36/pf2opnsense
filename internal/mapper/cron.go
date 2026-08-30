@@ -8,7 +8,7 @@ import (
 	"github.com/jacksonm36/pf2opnsense/internal/xmlutil"
 )
 
-var nicePrefix = regexp.MustCompile(`(?i)^(?:/usr/bin/nice\s+-n\s*\d+\s+)+`)
+var nicePrefix = regexp.MustCompile(`(?i)^(?:/usr/bin/nice\s+-n\s*-?\d+\s+|nice\s+-n\s*-?\d+\s+|nice\s+-?\d+\s+)+`)
 
 func mapCron(pfsense map[string]any, opt *Options, report *Notes) map[string]any {
 	items := xmlutil.AsArray(xmlutil.Get(pfsense, "cron", "item"))
@@ -18,10 +18,11 @@ func mapCron(pfsense map[string]any, opt *Options, report *Notes) map[string]any
 		item := xmlutil.Map(raw)
 		cmd := strings.TrimSpace(xmlutil.AsString(item["command"]))
 		if cmd == "" {
+			omitted = append(omitted, "empty command")
 			continue
 		}
 		who := orDefault(xmlutil.AsString(item["who"]), "root")
-		action, dropReason := ClassifyCron(cmd)
+		action, params, dropReason := ClassifyCron(cmd)
 		if dropReason != "" {
 			omitted = append(omitted, dropReason)
 			continue
@@ -31,17 +32,17 @@ func mapCron(pfsense map[string]any, opt *Options, report *Notes) map[string]any
 			continue
 		}
 		jobs = append(jobs, map[string]any{
-			"@_uuid":     nextUUID(opt),
-			"origin":     "cron",
-			"enabled":    "1",
-			"minutes":    orDefault(xmlutil.AsString(item["minute"]), "0"),
-			"hours":      orDefault(xmlutil.AsString(item["hour"]), "0"),
-			"days":       orDefault(xmlutil.AsString(item["mday"]), "*"),
-			"months":     orDefault(xmlutil.AsString(item["month"]), "*"),
-			"weekdays":   orDefault(xmlutil.AsString(item["wday"]), "*"),
-			"who":        who,
-			"command":    action,
-			"parameters": "",
+			"@_uuid":      nextUUID(opt),
+			"origin":      "cron",
+			"enabled":     "1",
+			"minutes":     cronField(item["minute"]),
+			"hours":       cronField(item["hour"]),
+			"days":        cronField(item["mday"]),
+			"months":      cronField(item["month"]),
+			"weekdays":    cronField(item["wday"]),
+			"who":         who,
+			"command":     action,
+			"parameters":  params,
 			"description": "Mapped from pfSense: " + stripNice(cmd),
 		})
 	}
@@ -58,35 +59,54 @@ func mapCron(pfsense map[string]any, opt *Options, report *Notes) map[string]any
 	return map[string]any{"jobs": map[string]any{"job": jobs}}
 }
 
+func cronField(value any) string {
+	s := strings.TrimSpace(xmlutil.AsString(value))
+	if s == "" {
+		return "*"
+	}
+	return s
+}
+
 func stripNice(cmd string) string {
 	return strings.TrimSpace(nicePrefix.ReplaceAllString(cmd, ""))
 }
 
-func ClassifyCron(cmd string) (action, dropReason string) {
+// ClassifyCron returns an OPNsense configd action, optional parameters, and a
+// drop reason. pfSense jobs that are not configctl actions cannot run on
+// OPNsense cron (which only executes configd actions).
+func ClassifyCron(cmd string) (action, params, dropReason string) {
 	c := stripNice(cmd)
 	lower := strings.ToLower(c)
 	switch {
 	case strings.Contains(lower, "rc.update_bogons") || strings.Contains(lower, "update_bogons"):
-		return "", "bogons (OPNsense schedules this from System settings)"
+		return "", "", "bogons (OPNsense schedules this from System settings)"
 	case strings.Contains(lower, "rc.dyndns") || strings.Contains(lower, "dyndns.update"):
-		return "", "DynDNS (handled by os-ddclient)"
+		return "", "", "DynDNS (handled by os-ddclient)"
 	case strings.Contains(lower, "update_urltables"):
-		return "", "URL tables (OPNsense refreshes aliases automatically)"
+		return "", "", "URL tables (OPNsense refreshes aliases automatically)"
 	case strings.Contains(lower, "/usr/local/pkg/"):
-		return "", "pfSense package script"
+		return "", "", "pfSense package script"
 	case strings.Contains(lower, "adjkerntz"):
-		return "", "adjkerntz (NTP handles timezone)"
+		return "", "", "adjkerntz (NTP handles timezone)"
 	case strings.Contains(lower, "expiretable"):
-		return "", "expiretable (OPNsense expires firewall tables itself)"
+		return "", "", "expiretable (OPNsense expires firewall tables itself)"
 	}
-	if strings.Contains(lower, "configctl ") {
-		idx := strings.Index(lower, "configctl ")
-		rest := strings.TrimSpace(c[idx+len("configctl "):])
-		if rest != "" {
-			return rest, ""
-		}
+	idx := strings.Index(lower, "configctl ")
+	if idx < 0 {
+		return "", "", ""
 	}
-	return "", ""
+	rest := strings.TrimSpace(c[idx+len("configctl "):])
+	if cut := strings.IndexAny(rest, "><"); cut >= 0 {
+		rest = strings.TrimSpace(rest[:cut])
+	}
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return "", "", ""
+	}
+	if len(fields) == 1 {
+		return fields[0], "", ""
+	}
+	return fields[0] + " " + fields[1], strings.Join(fields[2:], " "), ""
 }
 
 func summarizeCronOmits(reasons []string) string {

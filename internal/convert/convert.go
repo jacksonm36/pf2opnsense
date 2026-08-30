@@ -21,16 +21,17 @@ func Run(fileName, rawText string, opt ...*mapper.Options) Result {
 	ctx := validate.Context{FileName: fileName, RawText: rawText}
 	trimmed := strings.TrimSpace(rawText)
 	if trimmed == "" {
-		return Result{Validation: validate.Run(ctx), Stats: mapper.Stats{}}
+		return Result{Validation: validate.Run(ctx), Stats: mapper.Stats{}, Notes: []string{}, Skipped: []string{}}
 	}
 	parsed, err := xmlutil.Parse([]byte(trimmed))
 	if err != nil {
-		return Result{Validation: validate.Run(ctx), Skipped: []string{err.Error()}}
+		return Result{Validation: validate.Run(ctx), Notes: []string{}, Skipped: []string{err.Error()}}
 	}
 	ctx.ParsedInput = parsed
 	if xmlutil.Map(parsed["pfsense"]) == nil && xmlutil.Map(parsed["opnsense"]) == nil {
 		return Result{
 			Validation: validate.Run(ctx),
+			Notes:      []string{},
 			Skipped:    []string{"Not a pfSense or OPNsense configuration backup."},
 		}
 	}
@@ -41,7 +42,11 @@ func Run(fileName, rawText string, opt ...*mapper.Options) Result {
 	mapped, err := mapper.Map(parsed, mapOpt)
 	if err != nil {
 		ctx.ConvertErr = err.Error()
-		return Result{Validation: validate.Run(ctx), Skipped: []string{err.Error()}}
+		return Result{Validation: validate.Run(ctx), Notes: []string{}, Skipped: []string{err.Error()}}
+	}
+	if mapped == nil {
+		ctx.ConvertErr = "mapper returned no result"
+		return Result{Validation: validate.Run(ctx), Notes: []string{}, Skipped: []string{ctx.ConvertErr}}
 	}
 	pretty := toXML(mapped, true)
 	compact := xmlutil.CompactXML(toXML(mapped, false))
@@ -49,9 +54,16 @@ func Run(fileName, rawText string, opt ...*mapper.Options) Result {
 	ctx.OutputXML = pretty
 	ctx.Report = &mapped.Report
 	report := validate.Run(ctx)
+	notes, skipped := mapped.Report.Notes, mapped.Report.Skipped
+	if notes == nil {
+		notes = []string{}
+	}
+	if skipped == nil {
+		skipped = []string{}
+	}
 	out := Result{
-		Notes:      mapped.Report.Notes,
-		Skipped:    mapped.Report.Skipped,
+		Notes:      notes,
+		Skipped:    skipped,
 		Stats:      mapped.Report.Stats,
 		Validation: report,
 	}
