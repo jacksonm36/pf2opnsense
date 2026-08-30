@@ -14,6 +14,9 @@ jobs:
   build_push_to_registry:
     name: Build/Push Image to Docker Hub
     runs-on: ubuntu-latest
+    # Fork/local clones often have no Hub credentials. Skip instead of failing
+    # Log in to Docker Hub (username and password required).
+    if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
@@ -38,12 +41,10 @@ jobs:
           tags: |
             type=schedule
             type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=sha   
+            type=sha
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
