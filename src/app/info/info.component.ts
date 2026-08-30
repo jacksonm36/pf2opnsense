@@ -8,10 +8,10 @@ import { Component } from '@angular/core';
 export class InfoComponent {
 
   showInfoCard = true;
-  showDonations = true;
+  showDonations = false;
 
-  kofiURL = 'https://ko-fi.com/mwood77'
-  githubURL = 'https://github.com/sponsors/mwood77'
+  kofiURL = ''
+  githubURL = ''
 
   openSite(URL: string): void {
     window.open(URL, '_blank');

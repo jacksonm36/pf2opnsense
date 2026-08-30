@@ -3,3 +3,19 @@ node_modules
 .angular
 .vscode
 dist
+/pf2opn
+web/ui/node_modules
+web/static
+
+# secrets and local backups
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+config*.xml
+!sample-files/**
+
+# local incident notes (may contain site-specific data)
+docs/

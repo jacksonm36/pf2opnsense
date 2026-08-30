@@ -1,3 +1,7 @@
+.file-input {
+    display: none;
+}
+
 .contianer {
     margin-top: 1.5rem;
 }
@@ -6,36 +10,15 @@ mat-card {
     margin: 1rem;
 }
 
-pre { 
-    overflow-x: auto; 
-    tab-size: 4; 
+pre {
+    overflow-x: auto;
     background: black;
     color: white;
     padding: 20px;
 }
 
-form * {
-    display: block;
-    margin: 10px;
-}
-
-.error-code { 
-    color: red;
-}
-
-.full-screen-spacer {
-    flex: 1 1 auto;
-}
-
 .text {
     color: whitesmoke;
-}
-
-.progress-bar {
-  display: flex;
-  align-content: center;
-  align-items: center;
-  height: 60px;
 }
 
 .center {
@@ -48,46 +31,115 @@ form * {
     width: 2rem;
 }
 
-.upload-card {
-    margin-top: 1rem;
-    margin-bottom: 0.6rem;
-    margin-left: 1rem;
+.upload-button,
+.cancel-button {
+    height: 3rem;
+
+    .upload-button-text,
+    .cancel-button-text {
+        font-size: 1rem;
+    }
 }
 
 .upload-button {
-    height: 3rem;
     width: 50%;
-    
-    .upload-button-text {
-        font-size: 1rem;
-        // margin-top: 0.6rem;
-        // margin-bottom: 0.6rem;
-    }
 }
 
 .cancel-button {
-    height: 3rem;
     width: 10%;
-    
-    .cancel-button-text {
-        font-size: 1rem;
-        // margin-top: 0.6rem;
-        // margin-bottom: 0.6rem;
+}
+
+.conversion-notes {
+    color: whitesmoke;
+    margin: 0 1rem 1rem;
+
+    ul {
+        margin: 0.5rem 0 0 1rem;
+        padding: 0;
+    }
+
+    li {
+        margin-bottom: 0.4rem;
     }
 }
 
-.file-input {
-    display: none;
+.check-group {
+    margin: 0 0.5rem 0.5rem;
 }
 
+.check-heading {
+    color: whitesmoke;
+    font-size: 1rem;
+    font-weight: 500;
+    margin: 1.2rem 0 0.6rem;
+}
+
+.check-row {
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-start;
+    color: whitesmoke;
+    margin-bottom: 0.65rem;
+}
+
+.check-icon {
+    margin-top: 2px;
+}
+
+.check-title {
+    font-weight: 500;
+}
+
+.check-detail {
+    opacity: 0.85;
+    font-size: 0.9rem;
+    margin-top: 0.15rem;
+}
+
+.check-row[data-status='pass'] .check-icon { color: #7dcea0; }
+.check-row[data-status='warn'] .check-icon { color: #ffba00; }
+.check-row[data-status='fail'] .check-icon { color: #ff6b4a; }
+.check-row[data-status='running'] .check-icon { color: #80cbc4; }
+.check-row[data-status='skip'] .check-icon,
+.check-row[data-status='pending'] .check-icon { color: #9e9e9e; }
+
+.blocked-banner,
+.ready-banner {
+    margin: 1rem 0;
+    padding: 0.9rem 1rem;
+    font-weight: 500;
+}
+
+.blocked-banner {
+    background: #5c1c12;
+    color: #ffccbc;
+}
+
+.ready-banner {
+    background: #1b5e20;
+    color: #c8e6c9;
+}
+
+.ack {
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    color: whitesmoke;
+    margin: 1rem 0;
+    cursor: pointer;
+}
+
+.preview-toggle {
+    margin-top: 0.75rem;
+}
+
+.convert-button {
+    min-width: 18rem;
+}
 
 .caution-card {
     color: #1c1e21;
     background-color: #ffba00;
-
-    .mat-card-subtitle {
-        color: #1c1e21;
-    }
 
     .bold {
         font-size: 15px;
@@ -99,16 +151,7 @@ form * {
     color: whitesmoke;
     background-color: #ff4d00;
 
-    .mat-card-subtitle {
-        color: whitesmoke;
-    }
-
     .unsupported-content {
         padding: 1vh 0;
-    }
-
-    .unsupported {
-        font-size: 15px;
-        font-weight: 800;
     }
 }

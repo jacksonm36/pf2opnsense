@@ -5,20 +5,20 @@
     <mat-card class="mat-elevation-z1">
         <mat-card-header>
             <mat-card-title class="text">Upload</mat-card-title>
-            <mat-card-subtitle>Select your pfsense config file</mat-card-subtitle>
+            <mat-card-subtitle>pfSense 2.7.0 config.xml → OPNsense 26.7 · validators run before download</mat-card-subtitle>
           </mat-card-header>
 
           <mat-card-content class="text">
-            <input type="file" class="file-input"
+            <input type="file" class="file-input" accept=".xml,text/xml"
                 (change)="onFileSelected($event)" #fileUpload>
             <div class="center">
-                <button mat-raised-button color="primary" class="upload-button" (click)="fileUpload.click()" [disabled]="this.displayConversionCard">
+                <button mat-raised-button color="primary" class="upload-button" (click)="fileUpload.click()" [disabled]="checksRunning">
                     <div class="upload-button-text">{{ fileName || "Upload" }}</div>
                 </button>
 
                 <div class="horizontal-spacer"></div>
 
-                <button mat-stroked-button color="warn" class="cancel-button" (click)="reset($event)">
+                <button mat-stroked-button color="warn" class="cancel-button" (click)="reset()">
                     <div class="cancel-button-text">Reset</div>
                 </button>
             </div>
@@ -57,7 +57,14 @@
     <mat-card class="mat-elevation-z1" *ngIf="this.fileName && !this.unsupportedFile">
 
         <mat-card-header>
-            <mat-card-title class="text">Opnsense Conversion</mat-card-title>
+            <mat-card-title class="text">Validators</mat-card-title>
+            <mat-card-subtitle *ngIf="!validation && checksRunning">Checking source, conversion, and OPNsense 26.7 output…</mat-card-subtitle>
+            <mat-card-subtitle *ngIf="validation">
+                {{ validation.passed }} passed
+                · {{ validation.warnings }} warning{{ validation.warnings === 1 ? '' : 's' }}
+                · {{ validation.errors }} error{{ validation.errors === 1 ? '' : 's' }}
+                · {{ validation.skipped }} skipped
+            </mat-card-subtitle>
         </mat-card-header>
 
         <mat-card-content>
@@ -72,43 +79,85 @@
                 </mat-progress-bar>
             </div>
 
+            <div class="check-group" *ngIf="inputChecks.length">
+                <h3 class="check-heading">{{ groupLabel('input') }}</h3>
+                <div class="check-row" *ngFor="let check of inputChecks" [attr.data-status]="check.status">
+                    <mat-icon class="check-icon">{{ statusIcon(check.status) }}</mat-icon>
+                    <div>
+                        <div class="check-title">{{ check.title }}</div>
+                        <div class="check-detail">{{ check.detail }}</div>
+                    </div>
+                </div>
+            </div>
 
-            <div class="spacer"></div>
+            <div class="check-group" *ngIf="convertChecks.length">
+                <h3 class="check-heading">{{ groupLabel('convert') }}</h3>
+                <div class="check-row" *ngFor="let check of convertChecks" [attr.data-status]="check.status">
+                    <mat-icon class="check-icon">{{ statusIcon(check.status) }}</mat-icon>
+                    <div>
+                        <div class="check-title">{{ check.title }}</div>
+                        <div class="check-detail">{{ check.detail }}</div>
+                    </div>
+                </div>
+            </div>
 
-            <!-- Everything worked out! -->
-            <div *ngIf="this.conversionAvailable && !this.conversionError">
+            <div class="check-group" *ngIf="outputChecks.length">
+                <h3 class="check-heading">{{ groupLabel('output') }}</h3>
+                <div class="check-row" *ngFor="let check of outputChecks" [attr.data-status]="check.status">
+                    <mat-icon class="check-icon">{{ statusIcon(check.status) }}</mat-icon>
+                    <div>
+                        <div class="check-title">{{ check.title }}</div>
+                        <div class="check-detail">{{ check.detail }}</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="ready-banner" *ngIf="canDownload">
+                All required validators passed. Review any warnings, then download the OPNsense 26.7 config.
+            </div>
+
+            <div class="blocked-banner" *ngIf="validation && !validation.canDownload && !checksRunning">
+                Download is blocked until every validator is pass or warning. Fix the failing checks and upload again.
+            </div>
+
+            <div *ngIf="canDownload">
+                <div class="conversion-notes" *ngIf="conversionNotes.length">
+                    <p class="text"><strong>Conversion notes (OPNsense 26.7)</strong></p>
+                    <ul>
+                        <li *ngFor="let note of conversionNotes">{{ note }}</li>
+                    </ul>
+                </div>
+
+                <label class="ack" *ngIf="validation && validation.warnings > 0">
+                    <input type="checkbox" [(ngModel)]="acknowledgedWarnings">
+                    I reviewed the {{ validation.warnings }} warning{{ validation.warnings === 1 ? '' : 's' }} and will test this config in a lab.
+                </label>
+
                 <div class="center">
                     <div class="spacer"></div>
-                    <button mat-stroked-button color="accent" class="convert-button" (click)="download()">
-                        <div class="convert-button-text">Download generated config</div>
+                    <button mat-raised-button color="accent" class="convert-button"
+                        (click)="download()"
+                        [disabled]="downloadBlockedByWarnings">
+                        <div class="convert-button-text">Download OPNsense 26.7 config</div>
                     </button>
                 </div>
 
                 <div class="spacer"></div>
-                
                 <div class="center">
-                    <p class="text">Having trouble with whitespace during import?</p>
-                </div>
-                <div class="center">
-                    <button mat-stroked-button class="convert-button" (click)="downloadNoPretty()">
-                        <div class="convert-button-text">Download generated config without formatting</div>
+                    <button mat-stroked-button class="convert-button"
+                        (click)="downloadNoPretty()"
+                        [disabled]="downloadBlockedByWarnings">
+                        <div class="convert-button-text">Download without formatting</div>
                     </button>
                 </div>
 
-<!-- purposeful indent location -->
-<pre>
-<?xml version="1.0"?>
-{{ this.renderedXML }}
-</pre>
-            </div>
-
-            <!-- Something blew up! -->
-            <div *ngIf="this.conversionError">
-                <div class="center">
-                    <p class="text"><strong>Are you sure you uploaded a pfsense config file?</strong></p>
+                <div class="center preview-toggle">
+                    <button mat-button (click)="showXmlPreview = !showXmlPreview">
+                        {{ showXmlPreview ? 'Hide' : 'Show' }} XML preview
+                    </button>
                 </div>
-<!-- purposeful indent location -->
-<pre class="error-code">
+
+<pre *ngIf="showXmlPreview">
 {{ this.renderedXML }}
 </pre>
             </div>

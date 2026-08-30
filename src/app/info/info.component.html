@@ -8,21 +8,20 @@
           <mat-card-content class="text">
             <div class="text">
               The conversion happens on your machine, in-browser, using JavaScript. No data is sent to any server.
+              This fork maps <strong>pfSense 2.7.0</strong> (config revision 22.9) to <strong>OPNsense 26.7</strong>
+              (firewall rules, aliases, and gateways in the current MVC format; DHCP pools to dnsmasq).
+            </div>
+            <br>
+            <div class="text">
+              After upload, a pipeline of input, conversion, and output validators must all pass
+              (warnings are allowed after you acknowledge them) before a config.xml can be downloaded.
             </div>
             <br>
             <div class="text">
                 You can view the source code here:
                 <br>
-                 - <a target="_blank" href="https://github.com/mwood77/pf2opn">
-                  https://github.com/mwood77/pf2opn
-                </a>
-            </div>
-            <br>
-            <div class="text">
-                You can run this as a container on your own machine here:
-                <br>
-                 - <a target="_blank" href="https://hub.docker.com/r/mwood77/pf2opn">
-                  https://hub.docker.com/r/mwood77/pf2opn
+                 - <a target="_blank" href="https://github.com/jacksonm36/pf2opnsense">
+                  https://github.com/jacksonm36/pf2opnsense
                 </a>
             </div>
           </mat-card-content>
