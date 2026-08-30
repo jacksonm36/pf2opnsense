@@ -19,3 +19,7 @@ config*.xml
 
 # local incident notes (may contain site-specific data)
 docs/
+
+# local helper binaries
+.tools/
+
