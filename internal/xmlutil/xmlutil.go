@@ -25,12 +25,15 @@ var ArrayTags = map[string]struct{}{
 	"preSharedKey": {}, "job": {}, "SPD": {}, "subnet4": {}, "reservation": {},
 }
 
+// maxDepth caps element nesting. The parser recurses once per level, so an
+// unbounded document (a hostile "<a><a><a>…" upload well under any byte cap)
+// would otherwise exhaust the goroutine stack and crash the process with a
+// fatal error that no recover() can catch. Real pfSense/OPNsense configs nest
+// only a handful of levels deep.
+const maxDepth = 256
+
 func Parse(raw []byte) (map[string]any, error) {
-	dec := xml.NewDecoder(bytes.NewReader(raw))
-	dec.Entity = xml.HTMLEntity
-	dec.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
-		return input, nil
-	}
+	dec := newDecoder(bytes.NewReader(raw))
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -38,7 +41,7 @@ func Parse(raw []byte) (map[string]any, error) {
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			val, err := parseElement(dec, t)
+			val, err := parseElement(dec, t, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -51,7 +54,10 @@ func Parse(raw []byte) (map[string]any, error) {
 	}
 }
 
-func parseElement(dec *xml.Decoder, start xml.StartElement) (any, error) {
+func parseElement(dec *xml.Decoder, start xml.StartElement, depth int) (any, error) {
+	if depth >= maxDepth {
+		return nil, fmt.Errorf("XML nesting exceeds %d levels", maxDepth)
+	}
 	children := map[string]any{}
 	var text strings.Builder
 	hasChild := false
@@ -71,7 +77,7 @@ func parseElement(dec *xml.Decoder, start xml.StartElement) (any, error) {
 		switch t := tok.(type) {
 		case xml.StartElement:
 			hasChild = true
-			child, err := parseElement(dec, t)
+			child, err := parseElement(dec, t, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -302,6 +308,9 @@ func xmlEscapeAttr(v any) string {
 	s = strings.ReplaceAll(s, `&`, "&amp;")
 	s = strings.ReplaceAll(s, `"`, "&quot;")
 	s = strings.ReplaceAll(s, `<`, "&lt;")
+	s = strings.ReplaceAll(s, "\n", "&#10;")
+	s = strings.ReplaceAll(s, "\r", "&#13;")
+	s = strings.ReplaceAll(s, "\t", "&#9;")
 	return s
 }
 
@@ -327,6 +336,14 @@ func AsString(value any) string {
 		return v
 	case []byte:
 		return string(v)
+	case []any:
+		// ArrayTags is keyed on the bare tag name, so tags that are a list in
+		// one model and a scalar in another (local, remote, item) arrive here
+		// wrapped. Read through a single entry instead of printing the slice.
+		if len(v) == 1 {
+			return AsString(v[0])
+		}
+		return ""
 	case map[string]any:
 		if t, ok := v["#text"]; ok {
 			return fmt.Sprint(t)
@@ -343,6 +360,9 @@ func AsString(value any) string {
 	}
 }
 
+// FlagSet reports whether a value represents an enabled boolean. pfSense stores
+// most switches as presence flags (an empty <enable/> element means "on"), so an
+// empty string is true. An explicit "0", "no", "false" or "off" is false.
 func FlagSet(value any) bool {
 	if value == nil {
 		return false
@@ -350,8 +370,8 @@ func FlagSet(value any) bool {
 	if b, ok := value.(bool); ok {
 		return b
 	}
-	s := AsString(value)
-	if s == "0" {
+	switch strings.ToLower(strings.TrimSpace(AsString(value))) {
+	case "0", "no", "false", "off":
 		return false
 	}
 	return true
@@ -387,12 +407,14 @@ func LowerIdent(value any) string {
 	return strings.ToLower(strings.TrimSpace(AsString(value)))
 }
 
+var splitListRe = regexp.MustCompile(`[\s,]+`)
+
 func SplitList(value any) []string {
 	raw := strings.TrimSpace(AsString(value))
 	if raw == "" {
 		return nil
 	}
-	parts := regexp.MustCompile(`[\s,]+`).Split(raw, -1)
+	parts := splitListRe.Split(raw, -1)
 	out := make([]string, 0, len(parts))
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
@@ -438,13 +460,23 @@ func Get(value any, path ...string) any {
 	return cur
 }
 
+var compactXMLRe = regexp.MustCompile(`>\s+<`)
+
 func CompactXML(xmlText string) string {
-	re := regexp.MustCompile(`>\s+<`)
-	return re.ReplaceAllString(xmlText, "><")
+	return compactXMLRe.ReplaceAllString(xmlText, "><")
+}
+
+func newDecoder(r io.Reader) *xml.Decoder {
+	dec := xml.NewDecoder(r)
+	dec.Entity = xml.HTMLEntity
+	dec.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
+		return input, nil
+	}
+	return dec
 }
 
 func WellFormed(raw string) error {
-	dec := xml.NewDecoder(strings.NewReader(raw))
+	dec := newDecoder(strings.NewReader(raw))
 	foundRoot := false
 	for {
 		tok, err := dec.Token()

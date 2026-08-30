@@ -33,12 +33,22 @@ func dnsmasqFromScopes(pfsense map[string]any, scopes []dhcpScope, opt *Options,
 	for _, scope := range scopes {
 		ifaces = append(ifaces, scope.iface)
 		for _, rng := range scope.ranges {
-			ranges = append(ranges, map[string]any{
+			item := map[string]any{
 				"@_uuid":     nextUUID(opt),
 				"interface":  scope.iface,
 				"start_addr": rng.from,
 				"end_addr":   rng.to,
-			})
+			}
+			if mask := dhcpSubnetMask(pfsense, scope.iface); mask != "" {
+				item["subnet_mask"] = mask
+			}
+			if domain := dhcpDomain(pfsense, scope.cfg); domain != "" {
+				item["domain"] = domain
+			}
+			if lease := strings.TrimSpace(xmlutil.AsString(scope.cfg["defaultleasetime"])); lease != "" {
+				item["lease_time"] = lease
+			}
+			ranges = append(ranges, item)
 		}
 		for _, m := range scope.static {
 			ip, mac := xmlutil.AsString(m["ipaddr"]), xmlutil.AsString(m["mac"])
@@ -49,7 +59,7 @@ func dnsmasqFromScopes(pfsense map[string]any, scopes []dhcpScope, opt *Options,
 				"@_uuid": nextUUID(opt),
 				"host":   xmlutil.AsString(m["hostname"]),
 				"ip":     ip,
-				"hwaddr": mac,
+				"hwaddr": normalizeMAC(mac),
 				"descr":  xmlutil.AsString(m["descr"]),
 			})
 		}
@@ -75,6 +85,9 @@ func dnsmasqFromScopes(pfsense map[string]any, scopes []dhcpScope, opt *Options,
 	if len(ranges) > 0 {
 		report.Notes = append(report.Notes, fmt.Sprintf(
 			"Mapped DHCP pools to dnsmasq DHCP (%s default for small/medium networks).", OpnSeries))
+		if dropped := dhcpOptionSummary(scopes); dropped != "" {
+			report.Notes = append(report.Notes, "pfSense per-scope DHCP options ("+dropped+") are not written into dnsmasq ranges. Set them under Services → Dnsmasq DNS & DHCP → DHCP options after import.")
+		}
 	}
 	mapped := map[string]any{
 		"enable":    "1",
@@ -107,7 +120,8 @@ func keaFromScopes(pfsense map[string]any, scopes []dhcpScope, opt *Options, rep
 		cidr := interfaceCIDR(pfsense, scope.iface)
 		if cidr == "" {
 			report.Notes = append(report.Notes, fmt.Sprintf(
-				"Skipped Kea subnet for %s: the interface has no static IPv4 prefix to derive a CIDR from.", scope.iface))
+				"Skipped Kea subnet for %s: the interface has no static IPv4 prefix to derive a CIDR from. %d reservation(s) on that scope were also skipped.",
+				scope.iface, len(scope.static)))
 			continue
 		}
 		ifaces = append(ifaces, scope.iface)
@@ -125,6 +139,7 @@ func keaFromScopes(pfsense map[string]any, scopes []dhcpScope, opt *Options, rep
 		}
 		if optData := keaOptionData(pfsense, scope.cfg); len(optData) > 0 {
 			subnet["option_data"] = optData
+			subnet["option_data_autocollect"] = "0"
 		}
 		subnets = append(subnets, subnet)
 		for _, m := range scope.static {
@@ -274,14 +289,14 @@ func collectDhcpd(pfsense map[string]any) []dhcpScope {
 			continue
 		}
 		cfg := xmlutil.Map(dhcpd[iface])
-		if xmlutil.AsString(cfg["enable"]) == "0" {
+		if !xmlutil.FlagSet(cfg["enable"]) {
 			continue
 		}
-		rng := xmlutil.Map(cfg["range"])
+		ranges := dhcpRangesFromCfg(cfg)
 		scope := dhcpScope{
 			iface:  iface,
 			cfg:    cfg,
-			ranges: appendDHCPRange(nil, xmlutil.AsString(rng["from"]), xmlutil.AsString(rng["to"])),
+			ranges: ranges,
 		}
 		for _, sm := range xmlutil.AsArray(cfg["staticmap"]) {
 			if m := xmlutil.Map(sm); m != nil {
@@ -391,7 +406,7 @@ func interfaceCIDR(pfsense map[string]any, iface string) string {
 		return ""
 	}
 	bits, err := strconv.Atoi(xmlutil.AsString(ifc["subnet"]))
-	if err != nil || bits < 0 || bits > 32 {
+	if err != nil || bits < 1 || bits > 32 {
 		return ""
 	}
 	v4 := ip.To4()
@@ -419,7 +434,10 @@ func keaOptionData(pfsense map[string]any, cfg map[string]any) map[string]any {
 		out["domain_name"] = domain
 	}
 	if search := xmlutil.AsString(cfg["domainsearchlist"]); search != "" {
-		out["domain_search"] = strings.ReplaceAll(search, " ", ",")
+		out["domain_search"] = strings.Join(splitSearchList(search), ",")
+	}
+	if wins := csvField(cfg, "winsserver"); wins != "" {
+		out["netbios_name_servers"] = wins
 	}
 	if tftp := xmlutil.AsString(cfg["tftp"]); tftp != "" {
 		out["tftp_server_name"] = tftp
@@ -462,6 +480,91 @@ func normalizeMAC(s string) string {
 	s = strings.ReplaceAll(s, "-", ":")
 	s = strings.ReplaceAll(s, ".", ":")
 	return s
+}
+
+func dhcpRangesFromCfg(cfg map[string]any) []dhcpRange {
+	out := []dhcpRange{}
+	for _, raw := range xmlutil.AsArray(cfg["range"]) {
+		rng := xmlutil.Map(raw)
+		if rng == nil {
+			continue
+		}
+		out = appendDHCPRange(out, xmlutil.AsString(rng["from"]), xmlutil.AsString(rng["to"]))
+	}
+	for _, raw := range xmlutil.AsArray(cfg["pool"]) {
+		pool := xmlutil.Map(raw)
+		if pool == nil {
+			continue
+		}
+		for _, pr := range xmlutil.AsArray(pool["range"]) {
+			rng := xmlutil.Map(pr)
+			if rng == nil {
+				continue
+			}
+			out = appendDHCPRange(out, xmlutil.AsString(rng["from"]), xmlutil.AsString(rng["to"]))
+		}
+	}
+	return out
+}
+
+func dhcpSubnetMask(pfsense map[string]any, iface string) string {
+	cidr := interfaceCIDR(pfsense, iface)
+	if cidr == "" {
+		return ""
+	}
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil || ipnet == nil {
+		return ""
+	}
+	ones, bits := ipnet.Mask.Size()
+	if bits != 32 || ones < 1 {
+		return ""
+	}
+	return net.IP(ipnet.Mask).String()
+}
+
+func dhcpDomain(pfsense map[string]any, cfg map[string]any) string {
+	if d := strings.TrimSpace(xmlutil.AsString(cfg["domain"])); d != "" {
+		return d
+	}
+	return strings.TrimSpace(xmlutil.AsString(xmlutil.Get(pfsense, "system", "domain")))
+}
+
+func dhcpOptionSummary(scopes []dhcpScope) string {
+	seen := map[string]struct{}{}
+	order := []string{}
+	add := func(label string, present bool) {
+		if !present {
+			return
+		}
+		if _, ok := seen[label]; ok {
+			return
+		}
+		seen[label] = struct{}{}
+		order = append(order, label)
+	}
+	for _, scope := range scopes {
+		add("gateway", xmlutil.AsString(scope.cfg["gateway"]) != "")
+		add("DNS", csvField(scope.cfg, "dnsserver") != "")
+		add("NTP", csvField(scope.cfg, "ntpserver") != "")
+		add("TFTP", xmlutil.AsString(scope.cfg["tftp"]) != "" || xmlutil.AsString(scope.cfg["filename"]) != "")
+		add("WINS", csvField(scope.cfg, "winsserver") != "")
+	}
+	return strings.Join(order, ", ")
+}
+
+func splitSearchList(raw string) []string {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ';' || r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+	out := []string{}
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func parseIPv4(s string) net.IP {

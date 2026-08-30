@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/jacksonm36/pf2opnsense/internal/xmlutil"
 )
@@ -25,45 +24,116 @@ func mapOpnSense(input map[string]any, opt *Options) (*Result, error) {
 	if changed, _ := normalizeOpnVLANs(cfg, opt); changed {
 		report.Notes = append(report.Notes, "Normalized VLAN devices to OPNsense vlan0.<tag> names and assigned UUIDs so Edit VLAN can load.")
 	}
-	if liftNestedSwanctl(cfg) {
-		report.Notes = append(report.Notes, "Moved IPsec Connections from OPNsense/IPsec/Swanctl to OPNsense/Swanctl (26.7 model mount).")
+	if moved, conflicts := liftNestedSwanctl(cfg); moved {
+		report.Notes = append(report.Notes, fmt.Sprintf(
+			"Moved IPsec entries from OPNsense/IPsec/Swanctl to OPNsense/Swanctl (%s model mount).", OpnTarget()))
+		if len(conflicts) > 0 {
+			report.Notes = append(report.Notes, fmt.Sprintf(
+				"OPNsense/Swanctl already had %s that could not be item-merged; the nested copy of those sections was discarded. Check VPN → IPsec → Connections.",
+				strings.Join(conflicts, ", ")))
+		}
 	}
 	stampRevision(cfg, fmt.Sprintf("OPNsense DHCP remapped to %s by pf2opn for %s", dhcpBackend(opt), OpnTarget()))
 	return &Result{Root: map[string]any{"opnsense": cfg}, Report: report}, nil
 }
 
-// liftNestedSwanctl moves Connections from the wrong mount OPNsense/IPsec/Swanctl
+// liftNestedSwanctl moves the contents of the wrong mount OPNsense/IPsec/Swanctl
 // to OPNsense/Swanctl (//OPNsense/Swanctl in 26.7). Nested leftovers are always
 // stripped so run_migrations.php cannot ignore a real sibling and keep an empty one.
-func liftNestedSwanctl(cfg map[string]any) bool {
+// Sections are merged one by one: whatever already sits at the real mount wins,
+// and the sections that had to be dropped are returned so the report can name them.
+func liftNestedSwanctl(cfg map[string]any) (bool, []string) {
 	mvc := xmlutil.Map(cfg["OPNsense"])
 	if mvc == nil {
-		return false
+		return false, nil
 	}
 	ipsec := xmlutil.Map(mvc["IPsec"])
 	if ipsec == nil {
-		return false
+		return false, nil
 	}
 	nested := xmlutil.Map(ipsec["Swanctl"])
 	if nested == nil {
-		return false
+		return false, nil
+	}
+	target := xmlutil.Map(mvc["Swanctl"])
+	if target == nil {
+		target = map[string]any{}
+	}
+	moved := false
+	conflicts := []string{}
+	keys := make([]string, 0, len(nested))
+	for k := range nested {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := nested[key]
+		if xmlutil.IsEmptySection(value) {
+			continue
+		}
+		if strings.HasPrefix(key, "@_") {
+			if _, ok := target[key]; !ok {
+				target[key] = value
+			}
+			continue
+		}
+		if xmlutil.IsEmptySection(target[key]) {
+			target[key] = value
+			moved = true
+			continue
+		}
+		if merged, added := mergeSwanctlItems(target[key], value); added > 0 {
+			target[key] = merged
+			moved = true
+			continue
+		}
+		conflicts = append(conflicts, key)
 	}
 	delete(ipsec, "Swanctl")
-	mvc["IPsec"] = ipsec
-	moved := swanctlHasConnections(nested) && !swanctlHasConnections(xmlutil.Map(mvc["Swanctl"]))
-	if moved {
-		mvc["Swanctl"] = nested
+	if len(target) == 0 {
+		return false, nil
 	}
-	cfg["OPNsense"] = mvc
-	return moved
+	if _, ok := target["@_version"]; !ok {
+		target["@_version"] = "1.0.0"
+	}
+	mvc["Swanctl"] = target
+	return moved || len(conflicts) > 0, conflicts
 }
 
-func swanctlHasConnections(s map[string]any) bool {
-	if s == nil {
-		return false
+func mergeSwanctlItems(dst, src any) (any, int) {
+	dm := xmlutil.Map(dst)
+	sm := xmlutil.Map(src)
+	if dm == nil || sm == nil {
+		return dst, 0
 	}
-	return len(xmlutil.AsArray(xmlutil.Get(s, "Connections", "Connection"))) > 0 ||
-		len(xmlutil.AsArray(xmlutil.Get(s, "children", "child"))) > 0
+	out := cloneMap(dm)
+	added := 0
+	for _, ik := range []string{"Connection", "child", "local", "remote", "SPD", "preSharedKey"} {
+		incoming := xmlutil.AsArray(sm[ik])
+		if len(incoming) == 0 {
+			continue
+		}
+		existing := xmlutil.AsArray(out[ik])
+		seen := map[string]struct{}{}
+		for _, raw := range existing {
+			if id := xmlutil.AsString(xmlutil.Map(raw)["@_uuid"]); id != "" {
+				seen[id] = struct{}{}
+			}
+		}
+		for _, raw := range incoming {
+			id := xmlutil.AsString(xmlutil.Map(raw)["@_uuid"])
+			if id != "" {
+				if _, ok := seen[id]; ok {
+					continue
+				}
+				seen[id] = struct{}{}
+			}
+			existing = append(existing, raw)
+			added++
+		}
+		out[ik] = existing
+	}
+	return out, added
 }
 
 func stampRevision(cfg map[string]any, description string) {
@@ -74,7 +144,7 @@ func stampRevision(cfg map[string]any, description string) {
 		rev = cloneMap(rev)
 	}
 	rev["username"] = "pf2opn"
-	rev["time"] = fmt.Sprintf("%v", float64(time.Now().UnixMilli())/1000)
+	rev["time"] = revisionUnixTime()
 	rev["description"] = description
 	cfg["revision"] = rev
 }
@@ -259,12 +329,6 @@ func stripDnsmasqDHCP(dnsmasq map[string]any, dropMACHosts bool) map[string]any 
 	if len(xmlutil.AsArray(out["hosts"])) == 0 && !xmlutil.FlagSet(out["enable"]) {
 		return nil
 	}
-	if len(xmlutil.AsArray(out["hosts"])) == 0 {
-		delete(out, "enable")
-		if len(out) == 0 || (len(out) == 1 && xmlutil.AsString(out["port"]) != "") {
-			return nil
-		}
-	}
 	return out
 }
 
@@ -335,9 +399,6 @@ func collectDnsmasqScopes(cfg map[string]any) []dhcpScope {
 func collectKeaScopes(cfg map[string]any) []dhcpScope {
 	dhcp4 := xmlutil.Map(xmlutil.Get(cfg, "OPNsense", "Kea", "dhcp4"))
 	if dhcp4 == nil {
-		return nil
-	}
-	if xmlutil.AsString(xmlutil.Get(dhcp4, "general", "enabled")) == "0" {
 		return nil
 	}
 	subs := xmlutil.AsArray(xmlutil.Get(dhcp4, "subnets", "subnet4"))
@@ -432,7 +493,7 @@ func mergeDHCPScopesIntoKea(cfg map[string]any, extra []dhcpScope, opt *Options)
 	for _, sc := range extra {
 		idx, ok := ifaceToIdx[sc.iface]
 		cidr := interfaceCIDR(cfg, sc.iface)
-		if !ok {
+		if !ok && cidr != "" {
 			if j, found := cidrToIdx[cidr]; found {
 				idx, ok = j, true
 			}
@@ -463,6 +524,9 @@ func mergeDHCPScopesIntoKea(cfg map[string]any, extra []dhcpScope, opt *Options)
 			}
 		} else {
 			sub := xmlutil.Map(subnets[idx])
+			if sub == nil {
+				continue
+			}
 			pools := parseKeaPools(xmlutil.AsString(sub["pools"]))
 			before := len(pools)
 			for _, r := range sc.ranges {
@@ -645,8 +709,6 @@ func sanitizeDnsmasqInterfaces(cfg map[string]any) {
 	cleaned := validDhcpIfaces(cfg, splitCSV(xmlutil.AsString(dns["interface"])))
 	if len(cleaned) > 0 {
 		dns["interface"] = strings.Join(cleaned, ",")
-	} else {
-		delete(dns, "interface")
 	}
 }
 

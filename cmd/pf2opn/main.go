@@ -37,7 +37,14 @@ func main() {
 		jsonOut := fs.Bool("json", false, "print validation JSON instead of XML")
 		dhcp := fs.String("dhcp", mapper.DhcpDnsmasq, "DHCP backend: dnsmasq (default) or kea")
 		_ = fs.Parse(os.Args[2:])
-		inName, raw := readInput(fs.Args())
+		args := fs.Args()
+		for _, a := range args {
+			if strings.HasPrefix(a, "-") {
+				fmt.Fprintln(os.Stderr, "flags must come before the input filename, e.g. pf2opn convert -json in.xml")
+				os.Exit(2)
+			}
+		}
+		inName, raw := readInput(args)
 		result := convert.Run(inName, raw, &mapper.Options{DhcpBackend: mapper.ParseDhcpBackend(*dhcp)})
 		if *jsonOut {
 			enc := json.NewEncoder(os.Stdout)
@@ -59,22 +66,41 @@ func main() {
 			_ = enc.Encode(result.Validation)
 			os.Exit(2)
 		}
-		out := os.Stdout
-		if len(fs.Args()) >= 2 {
-			f, err := os.Create(fs.Args()[1])
+		if len(args) >= 2 {
+			f, err := os.OpenFile(args[1], os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
-			defer f.Close()
-			out = f
+			if _, err := io.WriteString(f, xml); err != nil {
+				_ = f.Close()
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			if !strings.HasSuffix(xml, "\n") {
+				if _, err := io.WriteString(f, "\n"); err != nil {
+					_ = f.Close()
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+			}
+			if err := f.Close(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
 		}
-		_, _ = io.WriteString(out, xml)
+		if _, err := io.WriteString(os.Stdout, xml); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		if !strings.HasSuffix(xml, "\n") {
-			_, _ = io.WriteString(out, "\n")
+			_, _ = io.WriteString(os.Stdout, "\n")
 		}
 	case "version", "-v", "--version":
 		fmt.Println("pf2opn", version)
+	case "help", "-h", "--help":
+		usage()
 	default:
 		usage()
 		os.Exit(2)

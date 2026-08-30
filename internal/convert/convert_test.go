@@ -565,6 +565,467 @@ func TestIPsecPSKDoesNotCopyRemoteToLocalIdent(t *testing.T) {
 	}
 }
 
+// pfSense stores nat_traversal=on (auto-detect) and mobike=off as plain
+// strings, and a phase 2 key length of "auto". Each of those used to produce a
+// Swanctl entry OPNsense rejects or that changes the tunnel's behaviour.
+func TestIPsecPhase1FlagsAndAutoKeylen(t *testing.T) {
+	raw := `<?xml version="1.0"?>
+<pfsense>
+  <version>22.9</version>
+  <system>
+    <hostname>edge</hostname>
+    <user><name>admin</name><uid>0</uid></user>
+  </system>
+  <interfaces>
+    <wan><if>em0</if><ipaddr>198.51.100.10</ipaddr><subnet>24</subnet></wan>
+    <lan><if>em1</if><ipaddr>192.168.1.1</ipaddr><subnet>24</subnet></lan>
+  </interfaces>
+  <ipsec>
+    <phase1>
+      <ikeid>1</ikeid>
+      <iketype>auto</iketype>
+      <interface>wan</interface>
+      <remote-gateway>203.0.113.1</remote-gateway>
+      <myid_type>myaddress</myid_type>
+      <peerid_type>peeraddress</peerid_type>
+      <authentication_method>pre_shared_key</authentication_method>
+      <pre-shared-key>secret</pre-shared-key>
+      <lifetime>28800</lifetime>
+      <nat_traversal>on</nat_traversal>
+      <mobike>off</mobike>
+      <dpd_delay>10</dpd_delay>
+      <dpd_maxfail>5</dpd_maxfail>
+      <hash-algorithm>sha256</hash-algorithm>
+      <dhgroup>15</dhgroup>
+      <encryption-algorithm><name>aes</name><keylen>256</keylen></encryption-algorithm>
+      <descr>office</descr>
+    </phase1>
+    <phase2>
+      <ikeid>1</ikeid>
+      <mode>tunnel</mode>
+      <reqid>1</reqid>
+      <lifetime>3600</lifetime>
+      <encryption-algorithm-option><name>aes</name><keylen>auto</keylen></encryption-algorithm-option>
+      <hash-algorithm-option>hmac_sha256</hash-algorithm-option>
+      <pfsgroup>15</pfsgroup>
+      <localid><type>lan</type></localid>
+      <remoteid><type>network</type><address>10.0.0.0</address><netbits>24</netbits></remoteid>
+      <descr>lan-to-lan</descr>
+    </phase2>
+  </ipsec>
+</pfsense>`
+	out := Run("ipsec-flags.xml", raw)
+	if !out.Validation.CanDownload {
+		t.Fatal(failSummary("ipsec phase1 flags", out))
+	}
+	checkStatus(t, out, "output-ipsec-model", "pass")
+
+	parsed, err := xmlutil.Parse([]byte(out.XML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := xmlutil.Map(parsed["opnsense"])
+	conn := xmlutil.Map(asArray(xmlutil.Get(root, "OPNsense", "Swanctl", "Connections", "Connection"))[0])
+	child := xmlutil.Map(asArray(xmlutil.Get(root, "OPNsense", "Swanctl", "children", "child"))[0])
+	psk := xmlutil.Map(asArray(xmlutil.Get(root, "OPNsense", "IPsec", "preSharedKeys", "preSharedKey"))[0])
+
+	for _, tc := range []struct{ field, want, why string }{
+		{"encap", "0", "pfSense nat_traversal=on only auto-detects NAT; encap forces UDP encapsulation"},
+		{"mobike", "0", "pfSense mobike=off must disable MOBIKE"},
+		{"version", "0", "pfSense iketype=auto is IKEv1+IKEv2"},
+		{"local_addrs", "198.51.100.10", "local_addrs comes from the phase 1 interface"},
+		{"dpd_timeout", "60", "dpd_timeout is dpd_delay * (dpd_maxfail + 1)"},
+	} {
+		if got := xmlutil.AsString(conn[tc.field]); got != tc.want {
+			t.Errorf("Connection %s = %q, want %q (%s)", tc.field, got, tc.want, tc.why)
+		}
+	}
+	if got := xmlutil.AsString(child["esp_proposals"]); got != "aes128-sha256-modp3072,aes192-sha256-modp3072,aes256-sha256-modp3072" {
+		t.Errorf("keylen=auto should expand to every AES size, got %q", got)
+	}
+	if got := xmlutil.AsString(child["local_ts"]); got != "192.168.1.0/24" {
+		t.Errorf("interface selector should be the LAN network, got %q", got)
+	}
+	if got := xmlutil.AsString(psk["ident"]); got != "198.51.100.10" {
+		t.Errorf("PSK ident should fall back to the local WAN address, got %q", got)
+	}
+}
+
+func TestIPsecChildModeAndSelectors(t *testing.T) {
+	raw := `<?xml version="1.0"?>
+<pfsense>
+  <version>22.9</version>
+  <system>
+    <hostname>edge</hostname>
+    <user><name>admin</name><uid>0</uid></user>
+  </system>
+  <interfaces>
+    <wan><if>em0</if><ipaddr>198.51.100.10</ipaddr><subnet>24</subnet></wan>
+    <lan><if>em1</if><ipaddr>192.168.1.1</ipaddr><subnet>24</subnet></lan>
+  </interfaces>
+  <ipsec>
+    <phase1>
+      <ikeid>1</ikeid>
+      <iketype>ikev2</iketype>
+      <interface>wan</interface>
+      <remote-gateway>203.0.113.1</remote-gateway>
+      <myid_type>address</myid_type>
+      <myid_data>198.51.100.10</myid_data>
+      <peerid_type>peeraddress</peerid_type>
+      <authentication_method>pre_shared_key</authentication_method>
+      <pre-shared-key>secret</pre-shared-key>
+      <lifetime>28800</lifetime>
+      <hash-algorithm>sha256</hash-algorithm>
+      <dhgroup>15</dhgroup>
+      <encryption-algorithm><name>aes</name><keylen>256</keylen></encryption-algorithm>
+      <descr>office</descr>
+    </phase1>
+    <phase2>
+      <ikeid>1</ikeid>
+      <mode>vti</mode>
+      <reqid>999999</reqid>
+      <lifetime>3600</lifetime>
+      <protocol>ah</protocol>
+      <encryption-algorithm-option><name>aes</name><keylen>256</keylen></encryption-algorithm-option>
+      <hash-algorithm-option>hmac_sha256</hash-algorithm-option>
+      <pfsgroup>15</pfsgroup>
+      <localid><type>network</type><address>192.168.9.7</address><netbits>24</netbits></localid>
+      <remoteid><type>none</type></remoteid>
+      <descr>routed</descr>
+    </phase2>
+  </ipsec>
+</pfsense>`
+	out := Run("ipsec-mode.xml", raw)
+	if !out.Validation.CanDownload {
+		t.Fatal(failSummary("ipsec child mode", out))
+	}
+	parsed, err := xmlutil.Parse([]byte(out.XML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := xmlutil.Map(parsed["opnsense"])
+	child := xmlutil.Map(asArray(xmlutil.Get(root, "OPNsense", "Swanctl", "children", "child"))[0])
+	if got := xmlutil.AsString(child["mode"]); got != "tunnel" {
+		t.Errorf("pfSense vti mode is not in the OPNsense option list, got %q", got)
+	}
+	if got := xmlutil.AsString(child["policies"]); got != "0" {
+		t.Errorf("VTI children must not install kernel policies, got policies=%q", got)
+	}
+	if got := xmlutil.AsString(child["reqid"]); got != "" {
+		t.Errorf("reqid outside 1-65535 should be dropped, got %q", got)
+	}
+	if got := xmlutil.AsString(child["local_ts"]); got != "192.168.9.0/24" {
+		t.Errorf("host bits should be cleared from the selector, got %q", got)
+	}
+	if got := xmlutil.AsString(child["remote_ts"]); got != "0.0.0.0/0" {
+		t.Errorf("type=none means any, got %q", got)
+	}
+	notes := strings.Join(out.Notes, "\n")
+	for _, want := range []string{"Virtual Tunnel Interfaces", "used AH"} {
+		if !strings.Contains(notes, want) {
+			t.Errorf("conversion notes should mention %q", want)
+		}
+	}
+}
+
+func TestOpnKeepsBothSwanctlMounts(t *testing.T) {
+	raw := `<?xml version="1.0"?>
+<opnsense>
+  <system>
+    <hostname>edge</hostname>
+    <domain>lan</domain>
+    <user><name>root</name><uid>0</uid></user>
+  </system>
+  <interfaces>
+    <wan><if>em0</if><ipaddr>dhcp</ipaddr></wan>
+  </interfaces>
+  <OPNsense>
+    <Swanctl version="1.0.0">
+      <Connections>
+        <Connection uuid="aaa">
+          <enabled>1</enabled>
+          <remote_addrs>peer-a.example.net</remote_addrs>
+          <description>real-mount</description>
+        </Connection>
+      </Connections>
+    </Swanctl>
+    <IPsec>
+      <Swanctl version="1.0.0">
+        <Connections>
+          <Connection uuid="bbb">
+            <enabled>1</enabled>
+            <remote_addrs>peer-b.example.net</remote_addrs>
+            <description>nested</description>
+          </Connection>
+        </Connections>
+        <SPDs>
+          <SPD uuid="ccc">
+            <enabled>1</enabled>
+            <protocol>esp</protocol>
+            <source>10.9.0.0/24</source>
+          </SPD>
+        </SPDs>
+      </Swanctl>
+    </IPsec>
+  </OPNsense>
+</opnsense>`
+	out := Run("both-swanctl.xml", raw)
+	if !out.Validation.CanDownload {
+		t.Fatal(failSummary("both Swanctl mounts", out))
+	}
+	parsed, err := xmlutil.Parse([]byte(out.XML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := xmlutil.Map(parsed["opnsense"])
+	if xmlutil.Get(root, "OPNsense", "IPsec", "Swanctl") != nil {
+		t.Fatal("nested IPsec/Swanctl must be removed")
+	}
+	conns := asArray(xmlutil.Get(root, "OPNsense", "Swanctl", "Connections", "Connection"))
+	if len(conns) != 2 {
+		t.Fatalf("item-level merge should keep both connections, got %#v", conns)
+	}
+	foundReal, foundNested := false, false
+	for _, raw := range conns {
+		switch xmlutil.AsString(xmlutil.Map(raw)["description"]) {
+		case "real-mount":
+			foundReal = true
+		case "nested":
+			foundNested = true
+		}
+	}
+	if !foundReal || !foundNested {
+		t.Fatalf("expected real-mount and nested connections, got %#v", conns)
+	}
+	if xmlutil.Get(root, "OPNsense", "Swanctl", "SPDs", "SPD") == nil {
+		t.Fatal("nested sections with no counterpart at the real mount must be kept")
+	}
+}
+
+func TestWireGuardPackageMapsToCoreModel(t *testing.T) {
+	raw := `<?xml version="1.0"?>
+<pfsense>
+  <version>22.9</version>
+  <system>
+    <hostname>edge</hostname>
+    <user><name>admin</name><uid>0</uid></user>
+  </system>
+  <interfaces>
+    <wan><if>em0</if><ipaddr>dhcp</ipaddr></wan>
+    <lan><if>em1</if><ipaddr>192.168.1.1</ipaddr><subnet>24</subnet></lan>
+    <opt1><if>tun_wg0</if><descr>WGVPN</descr><enable></enable></opt1>
+  </interfaces>
+  <installedpackages>
+    <package><name>WireGuard</name><internal_name>wireguard</internal_name></package>
+    <wireguard>
+      <config><enable>on</enable><keep_conf>yes</keep_conf></config>
+      <tunnels>
+        <item>
+          <name>tun_wg0</name><enabled>yes</enabled><descr>Road Warrior</descr>
+          <listenport>51820</listenport><mtu>1420</mtu>
+          <privatekey>cP1hE1w0Xk8m2N4vQ6rT8yU0iO2pA4sD6fG8hJ0kL2w=</privatekey>
+          <publickey>aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5zA7bC9c=</publickey>
+          <addresses><row><address>10.6.0.1</address><mask>24</mask></row></addresses>
+        </item>
+        <item>
+          <name>tun_wg9</name><enabled>no</enabled><descr>No secrets</descr>
+          <listenport>51829</listenport>
+          <addresses><row><address>10.9.0.1</address><mask>24</mask></row></addresses>
+        </item>
+      </tunnels>
+      <peers>
+        <item>
+          <enabled>yes</enabled><tun>tun_wg0</tun><descr>Laptop (Jane)</descr>
+          <endpoint>peer.example.net</endpoint><port>51820</port>
+          <persistentkeepalive>25</persistentkeepalive>
+          <publickey>eF6gH8iJ0kL2mN4oP6qR8sT0uV2wX4yZ6aB8cD0eF2e=</publickey>
+          <presharedkey>fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5zA7bC9dE1fG3f=</presharedkey>
+          <allowedips><row><address>10.6.0.2</address><mask>32</mask></row></allowedips>
+        </item>
+        <item>
+          <enabled>no</enabled><tun>unassigned</tun><descr>Old phone</descr>
+          <publickey>hI9jK1lM3nO5pQ7rS9tU1vW3xY5zA7bC9dE1fG3hI5h=</publickey>
+          <allowedips><row><address>10.6.0.9</address></row></allowedips>
+        </item>
+        <item>
+          <enabled>yes</enabled><tun>tun_wg9</tun><descr>Stranded</descr>
+          <publickey>iJ0kL2mN4oP6qR8sT0uV2wX4yZ6aB8cD0eF2gH4iJ6i=</publickey>
+          <allowedips><row><address>10.9.0.2</address><mask>32</mask></row></allowedips>
+        </item>
+      </peers>
+    </wireguard>
+  </installedpackages>
+</pfsense>`
+	out := Run("wireguard.xml", raw)
+	if !out.Validation.CanDownload {
+		t.Fatal(failSummary("wireguard package", out))
+	}
+	checkStatus(t, out, "output-wireguard", "pass")
+
+	parsed, err := xmlutil.Parse([]byte(out.XML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := xmlutil.Map(parsed["opnsense"])
+	if xmlutil.Get(root, "installedpackages", "wireguard") != nil {
+		t.Fatal("the pfSense package block must not survive alongside the mapped model")
+	}
+	servers := asArray(xmlutil.Get(root, "OPNsense", "wireguard", "server", "servers", "server"))
+	clients := asArray(xmlutil.Get(root, "OPNsense", "wireguard", "client", "clients", "client"))
+	if len(servers) != 1 {
+		t.Fatalf("the tunnel with no private key must be skipped, got %d instance(s)", len(servers))
+	}
+	// The peer of the skipped tunnel must survive too, or its key is lost.
+	if len(clients) != 3 {
+		t.Fatalf("every peer should be imported, got %d", len(clients))
+	}
+	byName := map[string]map[string]any{}
+	for _, raw := range clients {
+		c := xmlutil.Map(raw)
+		byName[xmlutil.AsString(c["name"])] = c
+	}
+	if _, ok := byName["Stranded"]; !ok {
+		t.Error("a peer whose tunnel was skipped must still be imported")
+	}
+	server := xmlutil.Map(servers[0])
+	for _, tc := range []struct{ field, want string }{
+		{"name", "Road_Warrior"},
+		{"instance", "0"},
+		{"port", "51820"},
+		{"mtu", "1420"},
+		{"tunneladdress", "10.6.0.1/24"},
+		{"enabled", "1"},
+	} {
+		if got := xmlutil.AsString(server[tc.field]); got != tc.want {
+			t.Errorf("server %s = %q, want %q", tc.field, got, tc.want)
+		}
+	}
+	peer := byName["Laptop_Jane"]
+	if peer == nil {
+		t.Fatal("the peer name should be sanitized to Laptop_Jane")
+	}
+	for _, tc := range []struct{ field, want string }{
+		{"tunneladdress", "10.6.0.2/32"},
+		{"serveraddress", "peer.example.net"},
+		{"serverport", "51820"},
+		{"keepalive", "25"},
+	} {
+		if got := xmlutil.AsString(peer[tc.field]); got != tc.want {
+			t.Errorf("peer %s = %q, want %q", tc.field, got, tc.want)
+		}
+	}
+	if got := xmlutil.AsString(server["peers"]); got != xmlutil.AsString(peer["@_uuid"]) {
+		t.Errorf("the instance should list its peer by uuid, got %q", got)
+	}
+	// The bare allowed IP on the unassigned peer needs a mask; the field is NetMaskRequired.
+	if got := xmlutil.AsString(byName["Old_phone"]["tunneladdress"]); got != "10.6.0.9/32" {
+		t.Errorf("a bare allowed IP should get a host mask, got %q", got)
+	}
+	if got := xmlutil.AsString(xmlutil.Get(root, "interfaces", "opt1", "if")); got != "wg0" {
+		t.Errorf("interface assignment should follow the rename, got %q", got)
+	}
+	notes := strings.Join(out.Notes, "\n")
+	for _, want := range []string{"tun_wg0 → wg0", "no plugin is needed", "unassigned"} {
+		if !strings.Contains(notes, want) {
+			t.Errorf("conversion notes should mention %q", want)
+		}
+	}
+	if strings.Contains(notes, "os-wireguard") {
+		t.Error("WireGuard is part of OPNsense core; the notes must not ask for a plugin")
+	}
+}
+
+// pfSense numbers openvpn-server and openvpn-client separately, so both lists
+// start at vpnid 1. OPNsense keeps one Instances list and rejects duplicates.
+func TestOpenVPNRenumbersCollidingVPNIDs(t *testing.T) {
+	raw := `<?xml version="1.0"?>
+<pfsense>
+  <version>22.9</version>
+  <system>
+    <hostname>edge</hostname>
+    <user><name>admin</name><uid>0</uid></user>
+  </system>
+  <interfaces>
+    <wan><if>em0</if><ipaddr>198.51.100.10</ipaddr><subnet>24</subnet></wan>
+    <lan><if>em1</if><ipaddr>192.168.1.1</ipaddr><subnet>24</subnet></lan>
+  </interfaces>
+  <openvpn>
+    <openvpn-server>
+      <vpnid>1</vpnid>
+      <description>road warriors</description>
+      <interface>wan</interface>
+      <local_port>1194</local_port>
+      <protocol>UDP</protocol>
+      <dev_mode>tun</dev_mode>
+      <tunnel_network>10.8.0.1/24</tunnel_network>
+      <local_network>192.168.1.0/24</local_network>
+      <dns_server1>192.168.1.1</dns_server1>
+      <dns_server2>1.1.1.1</dns_server2>
+      <dns_domain>lan</dns_domain>
+      <data_ciphers>AES-256-GCM,AES-128-GCM</data_ciphers>
+      <digest>SHA256</digest>
+      <strictusercn>yes</strictusercn>
+    </openvpn-server>
+    <openvpn-client>
+      <vpnid>1</vpnid>
+      <description>upstream</description>
+      <interface>wan</interface>
+      <server_addr>vpn.example.net</server_addr>
+      <server_port>1195</server_port>
+      <protocol>UDP</protocol>
+      <dev_mode>tun</dev_mode>
+      <data_ciphers>AES-256-GCM</data_ciphers>
+      <digest>SHA256</digest>
+    </openvpn-client>
+  </openvpn>
+</pfsense>`
+	out := Run("openvpn-vpnid.xml", raw)
+	if !out.Validation.CanDownload {
+		t.Fatal(failSummary("openvpn vpnid", out))
+	}
+	checkStatus(t, out, "output-openvpn-model", "pass")
+
+	parsed, err := xmlutil.Parse([]byte(out.XML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := xmlutil.Map(parsed["opnsense"])
+	instances := asArray(xmlutil.Get(root, "OPNsense", "OpenVPN", "Instances", "Instance"))
+	if len(instances) != 2 {
+		t.Fatalf("want 2 instances, got %d", len(instances))
+	}
+	byRole := map[string]map[string]any{}
+	for _, raw := range instances {
+		inst := xmlutil.Map(raw)
+		byRole[xmlutil.AsString(inst["role"])] = inst
+	}
+	server, client := byRole["server"], byRole["client"]
+	if xmlutil.AsString(server["vpnid"]) == xmlutil.AsString(client["vpnid"]) {
+		t.Fatalf("vpnid must be unique across instances, both are %q", xmlutil.AsString(server["vpnid"]))
+	}
+	if got := xmlutil.AsString(client["remote"]); got != "vpn.example.net:1195" {
+		t.Errorf("remote must be a host:port pair, got %q", got)
+	}
+	for _, tc := range []struct{ field, want, why string }{
+		{"server", "10.8.0.0/24", "the server field is strict and rejects host bits"},
+		{"local", "198.51.100.10", "pfSense binds by interface, OPNsense by address"},
+		{"dns_servers", "192.168.1.1,1.1.1.1", "pfSense numbers dns_serverN, OPNsense takes a list"},
+		{"dns_domain", "lan", "pushed DNS domain"},
+		{"strictusercn", "1", "strictusercn is an option list of 0, 1 and 2"},
+		// OPNsense only writes --keepalive when both are set; pfSense always
+		// wrote "keepalive 10 60".
+		{"keepalive_interval", "10", "pfSense default keepalive interval"},
+		{"keepalive_timeout", "60", "pfSense default keepalive timeout"},
+	} {
+		if got := xmlutil.AsString(server[tc.field]); got != tc.want {
+			t.Errorf("server %s = %q, want %q (%s)", tc.field, got, tc.want, tc.why)
+		}
+	}
+	if !strings.Contains(strings.Join(out.Notes, "\n"), "renumbered") {
+		t.Error("the renumbering should be reported")
+	}
+}
+
 func TestOpnLiftsNestedSwanctl(t *testing.T) {
 	raw := `<?xml version="1.0"?>
 <opnsense>
@@ -938,5 +1399,112 @@ func TestOpnAssignsMissingDnsmasqUUIDs(t *testing.T) {
 	iface := xmlutil.AsString(xmlutil.Get(root, "dnsmasq", "interface"))
 	if strings.Contains(iface, "dhcpddata") {
 		t.Fatalf("dhcpddata left in interface: %s", iface)
+	}
+}
+
+func TestIPsecStaysDisabledWithoutEnableFlag(t *testing.T) {
+	raw := `<?xml version="1.0"?>
+<pfsense>
+  <version>22.9</version>
+  <system><hostname>edge</hostname><user><name>admin</name><uid>0</uid></user></system>
+  <interfaces>
+    <wan><if>em0</if><ipaddr>198.51.100.10</ipaddr><subnet>24</subnet></wan>
+    <lan><if>em1</if><ipaddr>192.168.1.1</ipaddr><subnet>24</subnet></lan>
+  </interfaces>
+  <ipsec>
+    <phase1>
+      <ikeid>1</ikeid><iketype>ikev2</iketype><interface>wan</interface>
+      <remote-gateway>203.0.113.1</remote-gateway>
+      <myid_type>address</myid_type><myid_data>198.51.100.10</myid_data>
+      <peerid_type>peeraddress</peerid_type>
+      <authentication_method>pre_shared_key</authentication_method>
+      <pre-shared-key>secret</pre-shared-key>
+      <encryption-algorithm><name>aes</name><keylen>256</keylen></encryption-algorithm>
+      <hash-algorithm>sha256</hash-algorithm><dhgroup>15</dhgroup>
+    </phase1>
+    <phase2>
+      <ikeid>1</ikeid><mode>tunnel</mode>
+      <encryption-algorithm-option><name>aes256gcm</name><keylen>128</keylen></encryption-algorithm-option>
+      <hash-algorithm-option>hmac_sha256</hash-algorithm-option>
+      <pfsgroup>15</pfsgroup>
+      <localid><type>network</type><address>192.168.1.0</address><netbits>24</netbits></localid>
+      <remoteid><type>network</type><address>10.0.0.0</address><netbits>24</netbits></remoteid>
+    </phase2>
+  </ipsec>
+</pfsense>`
+	out := Run("ipsec-off.xml", raw)
+	if !out.Validation.CanDownload {
+		t.Fatal(failSummary("ipsec disabled", out))
+	}
+	parsed, err := xmlutil.Parse([]byte(out.XML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := xmlutil.Map(parsed["opnsense"])
+	if xmlutil.AsString(xmlutil.Get(root, "OPNsense", "IPsec", "general", "enabled")) != "0" {
+		t.Fatal("IPsec without pfSense <enable/> must stay disabled")
+	}
+	child := xmlutil.Map(asArray(xmlutil.Get(root, "OPNsense", "Swanctl", "children", "child"))[0])
+	if got := xmlutil.AsString(child["esp_proposals"]); got != "aes256gcm16-modp3072" {
+		t.Fatalf("AEAD ESP must not carry a hash, got %q", got)
+	}
+	if strings.Contains(xmlutil.AsString(xmlutil.Get(root, "revision", "time")), "e+") {
+		t.Fatalf("revision time must be decimal, got %s", xmlutil.AsString(xmlutil.Get(root, "revision", "time")))
+	}
+}
+
+func TestDisabledDhcpScopeIsNotServed(t *testing.T) {
+	raw := `<?xml version="1.0"?>
+<pfsense>
+  <version>22.9</version>
+  <system><hostname>edge</hostname><domain>lan</domain><user><name>admin</name><uid>0</uid></user></system>
+  <interfaces>
+    <wan><if>em0</if><ipaddr>dhcp</ipaddr></wan>
+    <lan><if>em1</if><ipaddr>192.168.1.1</ipaddr><subnet>24</subnet></lan>
+  </interfaces>
+  <dhcpd>
+    <lan>
+      <range><from>192.168.1.100</from><to>192.168.1.199</to></range>
+    </lan>
+  </dhcpd>
+</pfsense>`
+	out := Run("dhcp-off.xml", raw)
+	if !out.Validation.CanDownload {
+		t.Fatal(failSummary("disabled dhcp", out))
+	}
+	if strings.Contains(out.XML, "<dhcp_ranges") {
+		t.Fatal("a pfSense DHCP scope without <enable/> must not become a live range")
+	}
+	checkStatus(t, out, "output-dhcp", "skip")
+}
+
+func TestCronSplitsConfigctlParameters(t *testing.T) {
+	raw := `<?xml version="1.0"?>
+<pfsense>
+  <version>22.9</version>
+  <system><hostname>edge</hostname><user><name>admin</name><uid>0</uid></user></system>
+  <interfaces><lan><if>em1</if><ipaddr>192.168.1.1</ipaddr><subnet>24</subnet></lan></interfaces>
+  <cron>
+    <item>
+      <minute>*</minute><hour>*</hour><mday>*</mday><month>*</month><wday>*</wday>
+      <who>root</who>
+      <command>/usr/local/sbin/configctl interface reload wan &gt; /dev/null 2&gt;&amp;1</command>
+    </item>
+  </cron>
+</pfsense>`
+	out := Run("cron.xml", raw)
+	if !out.Validation.CanDownload {
+		t.Fatal(failSummary("cron params", out))
+	}
+	parsed, err := xmlutil.Parse([]byte(out.XML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := xmlutil.Map(asArray(xmlutil.Get(parsed, "opnsense", "OPNsense", "cron", "jobs", "job"))[0])
+	if xmlutil.AsString(job["command"]) != "interface reload" {
+		t.Fatalf("command = %q", xmlutil.AsString(job["command"]))
+	}
+	if xmlutil.AsString(job["parameters"]) != "wan" {
+		t.Fatalf("parameters = %q", xmlutil.AsString(job["parameters"]))
 	}
 }
