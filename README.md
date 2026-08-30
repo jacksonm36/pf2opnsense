@@ -4,7 +4,7 @@ pfSense 2.7.0 (config revision 22.9) or OPNsense → OPNsense **26.7 series** co
 
 The converter is a **native Go binary**. It maps the backup on the machine that runs it, then either writes XML to stdout or serves a small web UI.
 
-Derived from the [pf2opn](https://github.com/mwood77/pf2opn) project (CC BY-NC 4.0).
+Original author: [mwood77](https://github.com/mwood77). This repository is derived from [pf2opn](https://github.com/mwood77/pf2opn) (CC BY-NC 4.0).
 
 What is mapped into the current OPNsense 26.7 layout:
 

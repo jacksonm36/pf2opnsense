@@ -267,6 +267,7 @@
     </div>
     <p class="foot">
       <a href="https://github.com/jacksonm36/pf2opnsense" target="_blank" rel="noreferrer">Source</a>
+      · based on <a href="https://github.com/mwood77/pf2opn" target="_blank" rel="noreferrer">pf2opn</a> by mwood77
     </p>
   </section>
 
