@@ -560,6 +560,9 @@ func TestIPsecPSKDoesNotCopyRemoteToLocalIdent(t *testing.T) {
 	if strings.Contains(out.XML, "<ident>vpn-peer.example.net</ident>") {
 		t.Fatal("PSK local ident must not be filled with the remote gateway")
 	}
+	if !strings.Contains(out.XML, "<ident>%any</ident>") {
+		t.Fatal("empty local ident on a dynamic WAN should become %any so swanctl can match")
+	}
 	if !strings.Contains(out.XML, "<remote_ident>vpn-peer.example.net</remote_ident>") {
 		t.Fatal("PSK remote ident should be the peer hostname")
 	}
@@ -1399,6 +1402,119 @@ func TestOpnAssignsMissingDnsmasqUUIDs(t *testing.T) {
 	iface := xmlutil.AsString(xmlutil.Get(root, "dnsmasq", "interface"))
 	if strings.Contains(iface, "dhcpddata") {
 		t.Fatalf("dhcpddata left in interface: %s", iface)
+	}
+}
+
+func TestOpnSanitizesLeftoversAndFillsDefaults(t *testing.T) {
+	raw := `<?xml version="1.0"?>
+<opnsense>
+  <system>
+    <hostname>edge</hostname>
+    <user><name>admin</name><uid>0</uid></user>
+  </system>
+  <interfaces>
+    <wan><if>em0</if><ipaddr>198.51.100.10</ipaddr><subnet>24</subnet></wan>
+    <lan><if>em1</if><ipaddr>192.168.1.1</ipaddr><subnet>24</subnet></lan>
+  </interfaces>
+  <ovpnserver><step1>1</step1></ovpnserver>
+  <openvpn>
+    <openvpn-server>
+      <vpnid>1</vpnid>
+      <mode>p2p_tls</mode>
+      <protocol>UDP4</protocol>
+      <dev_mode>tun</dev_mode>
+      <interface>wan</interface>
+      <local_port>1194</local_port>
+      <tunnel_network>10.8.0.0/24</tunnel_network>
+      <description>PowerQuattro employee</description>
+    </openvpn-server>
+  </openvpn>
+  <ipsec>
+    <enable/>
+    <phase1>
+      <ikeid>1</ikeid>
+      <iketype>ikev2</iketype>
+      <interface>wan</interface>
+      <remote-gateway>203.0.113.1</remote-gateway>
+      <myid_type>myaddress</myid_type>
+      <peerid_type>peeraddress</peerid_type>
+      <authentication_method>pre_shared_key</authentication_method>
+      <pre-shared-key>secret</pre-shared-key>
+      <hash-algorithm>sha256</hash-algorithm>
+      <dhgroup>15</dhgroup>
+      <encryption-algorithm><name>aes</name><keylen>256</keylen></encryption-algorithm>
+      <descr>EffectiveGroup</descr>
+    </phase1>
+    <phase2>
+      <ikeid>1</ikeid>
+      <mode>tunnel</mode>
+      <encryption-algorithm-option><name>aes</name><keylen>256</keylen></encryption-algorithm-option>
+      <hash-algorithm-option>hmac_sha256</hash-algorithm-option>
+      <pfsgroup>15</pfsgroup>
+      <localid><type>network</type><address>192.168.1.0</address><netbits>24</netbits></localid>
+      <remoteid><type>network</type><address>10.0.0.0</address><netbits>24</netbits></remoteid>
+    </phase2>
+  </ipsec>
+  <OPNsense>
+    <OpenVPN>
+      <Instances>
+        <Instance uuid="already">
+          <role>server</role>
+          <proto>udp</proto>
+          <topology>subnet</topology>
+          <vpnid>1</vpnid>
+          <description>existing</description>
+        </Instance>
+      </Instances>
+    </OpenVPN>
+    <IPsec>
+      <general><enabled>1</enabled></general>
+      <preSharedKeys>
+        <preSharedKey uuid="psk1">
+          <ident></ident>
+          <remote_ident>203.0.113.1</remote_ident>
+          <keyType>PSK</keyType>
+          <Key>secret</Key>
+          <description>EffectiveGroup</description>
+        </preSharedKey>
+      </preSharedKeys>
+    </IPsec>
+  </OPNsense>
+</opnsense>`
+	out := Run("opn-leftovers.xml", raw)
+	if !out.Validation.CanDownload {
+		t.Fatal(failSummary("OPNsense leftovers", out))
+	}
+	checkStatus(t, out, "output-system", "pass")
+	checkStatus(t, out, "output-openvpn", "pass")
+	checkStatus(t, out, "output-openvpn-model", "pass")
+	checkStatus(t, out, "output-ipsec", "pass")
+	checkStatus(t, out, "output-ovpnwizard", "skip")
+	parsedXML, err := xmlutil.Parse([]byte(out.XML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := xmlutil.Map(parsedXML["opnsense"])
+	if xmlutil.Get(root, "ovpnserver") != nil {
+		t.Fatal("wizard leftover must be removed")
+	}
+	if xmlutil.Get(root, "openvpn", "openvpn-server") != nil {
+		t.Fatal("legacy OpenVPN must be mapped away")
+	}
+	if xmlutil.Get(root, "ipsec", "phase1") != nil {
+		t.Fatal("legacy IPsec phase1 must be mapped away")
+	}
+	if !strings.Contains(out.XML, "<name>root</name>") {
+		t.Fatal("uid 0 must be renamed to root")
+	}
+	if !strings.Contains(out.XML, "<ident>%any</ident>") {
+		t.Fatal("empty PSK ident must become %any")
+	}
+	for _, raw := range asArray(xmlutil.Get(root, "OPNsense", "OpenVPN", "Instances", "Instance")) {
+		inst := xmlutil.Map(raw)
+		if xmlutil.AsString(inst["keepalive_interval"]) == "" || xmlutil.AsString(inst["keepalive_timeout"]) == "" {
+			t.Fatalf("instance %q missing keepalive", xmlutil.AsString(inst["description"]))
+		}
 	}
 }
 

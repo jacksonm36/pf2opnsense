@@ -996,12 +996,7 @@ const (
 // ovpnKeepalive returns the interval and timeout to write. OPNsense rejects the
 // instance unless timeout is at least twice the interval and both are set
 // together, so a lopsided pfSense pair is widened rather than dropped.
-func ovpnKeepalive(node map[string]any) (string, string, bool) {
-	// A custom ping action replaces keepalive entirely on pfSense; there is no
-	// OPNsense field for it, so do not invent one.
-	if xmlutil.AsString(node["ping_action"]) != "" {
-		return "", "", false
-	}
+func ovpnKeepalive(node map[string]any) (string, string) {
 	interval := ovpnKeepaliveInterval
 	if n, err := strconv.Atoi(strings.TrimSpace(xmlutil.AsString(node["keepalive_interval"]))); err == nil && n > 0 {
 		interval = n
@@ -1013,7 +1008,7 @@ func ovpnKeepalive(node map[string]any) (string, string, bool) {
 	if timeout < interval*2 {
 		timeout = interval * 2
 	}
-	return strconv.Itoa(interval), strconv.Itoa(timeout), true
+	return strconv.Itoa(interval), strconv.Itoa(timeout)
 }
 
 // joinNetworks flattens pfSense's numbered/paired network fields into the comma
@@ -1239,13 +1234,13 @@ func mapOpenVPN(pfsense map[string]any, opt *Options, report *Notes) map[string]
 		// default) unless a custom ping action replaces it. OPNsense only
 		// writes the directive when both fields are set, so leaving them empty
 		// drops dead-peer detection and logs "--keepalive option is missing".
-		if interval, timeout, ok := ovpnKeepalive(node); ok {
-			instance["keepalive_interval"] = interval
-			instance["keepalive_timeout"] = timeout
-		} else if xmlutil.AsString(node["ping_action"]) != "" {
+		interval, timeout := ovpnKeepalive(node)
+		instance["keepalive_interval"] = interval
+		instance["keepalive_timeout"] = timeout
+		if xmlutil.AsString(node["ping_action"]) != "" {
 			report.Notes = append(report.Notes, fmt.Sprintf(
-				`OpenVPN "%s" used a pfSense ping action instead of keepalive; OPNsense Instances have no equivalent, so keepalive was left unset. Set Keepalive interval/timeout under VPN → OpenVPN → Instances.`,
-				label))
+				`OpenVPN "%s" used a pfSense ping action; OPNsense Instances have no equivalent, so keepalive %s/%s was written instead.`,
+				label, interval, timeout))
 		}
 		if xmlutil.AsString(node["certref"]) != "" {
 			instance["cert"] = xmlutil.AsString(node["certref"])

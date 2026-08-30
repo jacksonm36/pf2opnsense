@@ -3,6 +3,7 @@ package mapper
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/jacksonm36/pf2opnsense/internal/xmlutil"
@@ -21,6 +22,7 @@ func mapOpnSense(input map[string]any, opt *Options) (*Result, error) {
 		},
 	}
 	applyOpnDHCP(cfg, opt, &report)
+	sanitizeOpnSense(cfg, opt, &report)
 	if changed, _ := normalizeOpnVLANs(cfg, opt); changed {
 		report.Notes = append(report.Notes, "Normalized VLAN devices to OPNsense vlan0.<tag> names and assigned UUIDs so Edit VLAN can load.")
 	}
@@ -33,8 +35,221 @@ func mapOpnSense(input map[string]any, opt *Options) (*Result, error) {
 				strings.Join(conflicts, ", ")))
 		}
 	}
-	stampRevision(cfg, fmt.Sprintf("OPNsense DHCP remapped to %s by pf2opn for %s", dhcpBackend(opt), OpnTarget()))
+	stampRevision(cfg, fmt.Sprintf("OPNsense config sanitized for %s by pf2opn (%s DHCP)", OpnTarget(), dhcpBackend(opt)))
 	return &Result{Root: map[string]any{"opnsense": cfg}, Report: report}, nil
+}
+
+// sanitizeOpnSense repairs leftover pfSense-shaped data that blocks restore on
+// 26.7: uid 0 must be named root, OpenVPN/IPsec must be MVC Instances/Swanctl,
+// and the OpenVPN wizard block is not used.
+func sanitizeOpnSense(cfg map[string]any, opt *Options, report *Notes) {
+	renameOpnRoot(cfg, report)
+	if !xmlutil.IsEmptySection(cfg["ovpnserver"]) {
+		delete(cfg, "ovpnserver")
+		report.Notes = append(report.Notes, "Removed leftover pfSense OpenVPN wizard state; it is not used by OPNsense 26.7.")
+	}
+	// Lift leftover pfSense VPN blocks first so keepalive / PSK fills
+	// also cover the instances and keys that mapping just created.
+	liftLegacyOpenVPN(cfg, opt, report)
+	liftLegacyIPsec(cfg, opt, report)
+	fillOpenVPNKeepalive(cfg, report)
+	fillIPsecPSKIdents(cfg, report)
+}
+
+func renameOpnRoot(cfg map[string]any, report *Notes) {
+	system := xmlutil.Map(cfg["system"])
+	if system == nil {
+		return
+	}
+	for _, raw := range xmlutil.AsArray(system["user"]) {
+		u := xmlutil.Map(raw)
+		if xmlutil.AsString(u["uid"]) == "0" && xmlutil.AsString(u["name"]) != "root" {
+			report.Notes = append(report.Notes, fmt.Sprintf(
+				`Renamed uid 0 user "%s" to "root" (OPNsense requires the root account).`, xmlutil.AsString(u["name"])))
+			u["name"] = "root"
+		}
+	}
+}
+
+func fillOpenVPNKeepalive(cfg map[string]any, report *Notes) {
+	filled := 0
+	for _, raw := range xmlutil.AsArray(xmlutil.Get(cfg, "OPNsense", "OpenVPN", "Instances", "Instance")) {
+		inst := xmlutil.Map(raw)
+		if inst == nil {
+			continue
+		}
+		_, hadInterval := parsePositive(inst["keepalive_interval"])
+		_, hadTimeout := parsePositive(inst["keepalive_timeout"])
+		interval, timeout := ovpnKeepalive(inst)
+		inst["keepalive_interval"] = interval
+		inst["keepalive_timeout"] = timeout
+		if !hadInterval || !hadTimeout {
+			filled++
+		}
+	}
+	if filled > 0 {
+		report.Notes = append(report.Notes, fmt.Sprintf(
+			"Set keepalive %d/%d on %d OpenVPN instance(s) that had none, so dead peers are dropped.",
+			ovpnKeepaliveInterval, ovpnKeepaliveTimeout, filled))
+	}
+}
+
+func fillIPsecPSKIdents(cfg map[string]any, report *Notes) {
+	filled := 0
+	for _, raw := range xmlutil.AsArray(xmlutil.Get(cfg, "OPNsense", "IPsec", "preSharedKeys", "preSharedKey")) {
+		psk := xmlutil.Map(raw)
+		if psk == nil {
+			continue
+		}
+		if strings.TrimSpace(xmlutil.AsString(psk["ident"])) != "" {
+			continue
+		}
+		psk["ident"] = "%any"
+		filled++
+	}
+	if filled > 0 {
+		report.Notes = append(report.Notes, fmt.Sprintf(
+			"Filled %%any as the local identifier on %d IPsec pre-shared key(s) that had none, so swanctl secrets can match.",
+			filled))
+	}
+}
+
+func liftLegacyOpenVPN(cfg map[string]any, opt *Options, report *Notes) {
+	ovpn := xmlutil.Map(cfg["openvpn"])
+	if ovpn == nil {
+		return
+	}
+	had := len(xmlutil.AsArray(ovpn["openvpn-server"]))+len(xmlutil.AsArray(ovpn["openvpn-client"]))+len(xmlutil.AsArray(ovpn["openvpn-csc"])) > 0
+	if !had {
+		delete(cfg, "openvpn")
+		return
+	}
+	mapped := mapOpenVPN(cfg, opt, report)
+	delete(cfg, "openvpn")
+	if mapped == nil {
+		return
+	}
+	mvc := ensureOpnMVC(cfg)
+	if existing := xmlutil.Map(mvc["OpenVPN"]); existing != nil {
+		mergeOpenVPNBlock(existing, mapped)
+		mvc["OpenVPN"] = existing
+	} else {
+		mvc["OpenVPN"] = mapped
+	}
+	report.Notes = append(report.Notes, "Mapped leftover pfSense <openvpn-server>/<openvpn-client> to VPN → OpenVPN → Instances.")
+}
+
+func liftLegacyIPsec(cfg map[string]any, opt *Options, report *Notes) {
+	src := xmlutil.Map(cfg["ipsec"])
+	if src == nil {
+		return
+	}
+	if len(usablePhase1(src))+len(usableMobileKeys(src)) == 0 {
+		if len(xmlutil.AsArray(src["phase1"]))+len(xmlutil.AsArray(src["phase2"])) > 0 {
+			delete(cfg, "ipsec")
+			report.Notes = append(report.Notes, "Removed leftover unused <ipsec><phase1> so OPNsense 26.7 does not see legacy Tunnel Settings.")
+		}
+		return
+	}
+	ipsec, swanctl := mapIPsec(cfg, opt, report)
+	delete(cfg, "ipsec")
+	mvc := ensureOpnMVC(cfg)
+	if ipsec != nil {
+		if existing := xmlutil.Map(mvc["IPsec"]); existing != nil {
+			mergeIPsecKeys(existing, ipsec)
+			mvc["IPsec"] = existing
+		} else {
+			mvc["IPsec"] = ipsec
+		}
+	}
+	if swanctl != nil {
+		if existing := xmlutil.Map(mvc["Swanctl"]); existing != nil {
+			for _, key := range []string{"Connections", "children", "locals", "remotes", "SPDs"} {
+				if merged, added := mergeSwanctlItems(existing[key], swanctl[key]); added > 0 {
+					existing[key] = merged
+				} else if xmlutil.IsEmptySection(existing[key]) && !xmlutil.IsEmptySection(swanctl[key]) {
+					existing[key] = swanctl[key]
+				}
+			}
+			mvc["Swanctl"] = existing
+		} else {
+			mvc["Swanctl"] = swanctl
+		}
+	}
+	report.Notes = append(report.Notes, "Mapped leftover pfSense <ipsec><phase1> to VPN → IPsec → Connections (OPNsense/Swanctl).")
+}
+
+func ensureOpnMVC(cfg map[string]any) map[string]any {
+	mvc := xmlutil.Map(cfg["OPNsense"])
+	if mvc == nil {
+		mvc = map[string]any{}
+		cfg["OPNsense"] = mvc
+	}
+	return mvc
+}
+
+func mergeOpenVPNBlock(dst, src map[string]any) {
+	pool := newVPNIDPool()
+	dstInst := xmlutil.AsArray(xmlutil.Get(dst, "Instances", "Instance"))
+	for _, raw := range dstInst {
+		pool.reserve(xmlutil.AsString(xmlutil.Map(raw)["vpnid"]))
+		pool.take(xmlutil.AsString(xmlutil.Map(raw)["vpnid"]))
+	}
+	for _, raw := range xmlutil.AsArray(xmlutil.Get(src, "Instances", "Instance")) {
+		inst := xmlutil.Map(raw)
+		if inst == nil {
+			continue
+		}
+		inst["vpnid"] = pool.take(xmlutil.AsString(inst["vpnid"]))
+		dstInst = append(dstInst, inst)
+	}
+	if len(dstInst) > 0 {
+		if xmlutil.Map(dst["Instances"]) == nil {
+			dst["Instances"] = map[string]any{}
+		}
+		xmlutil.Map(dst["Instances"])["Instance"] = dstInst
+	}
+	for _, section := range []struct{ parent, child string }{
+		{"Overwrites", "Overwrite"},
+		{"StaticKeys", "StaticKey"},
+	} {
+		cur := xmlutil.AsArray(xmlutil.Get(dst, section.parent, section.child))
+		cur = append(cur, xmlutil.AsArray(xmlutil.Get(src, section.parent, section.child))...)
+		if len(cur) == 0 {
+			continue
+		}
+		if xmlutil.Map(dst[section.parent]) == nil {
+			dst[section.parent] = map[string]any{}
+		}
+		xmlutil.Map(dst[section.parent])[section.child] = cur
+	}
+}
+
+func mergeIPsecKeys(dst, src map[string]any) {
+	cur := xmlutil.AsArray(xmlutil.Get(dst, "preSharedKeys", "preSharedKey"))
+	cur = append(cur, xmlutil.AsArray(xmlutil.Get(src, "preSharedKeys", "preSharedKey"))...)
+	if len(cur) == 0 {
+		return
+	}
+	if xmlutil.Map(dst["preSharedKeys"]) == nil {
+		dst["preSharedKeys"] = map[string]any{}
+	}
+	xmlutil.Map(dst["preSharedKeys"])["preSharedKey"] = cur
+	if xmlutil.AsString(xmlutil.Get(src, "general", "enabled")) == "1" {
+		if g := xmlutil.Map(dst["general"]); g != nil {
+			g["enabled"] = "1"
+		} else {
+			dst["general"] = map[string]any{"enabled": "1"}
+		}
+	}
+}
+
+func parsePositive(value any) (int, bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(xmlutil.AsString(value)))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // liftNestedSwanctl moves the contents of the wrong mount OPNsense/IPsec/Swanctl

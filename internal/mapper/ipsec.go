@@ -123,9 +123,9 @@ func mapIPsec(pfsense map[string]any, opt *Options, report *Notes) (ipsec, swanc
 				// OPNsense writes "id-0 = <ident>" into swanctl secrets, so an empty
 				// ident silently produces a key strongSwan can never match.
 				ident := pskIdent(localID, localAddr)
-				if ident == "" {
+				if ident == "%any" && localID == "" && localAddr == "" {
 					report.Notes = append(report.Notes, fmt.Sprintf(
-						`IPsec pre-shared key for "%s" has no local identifier (pfSense used "My IP address" on a dynamic WAN). Set the local identifier under VPN → IPsec → Pre-Shared Keys before the tunnel will authenticate.`,
+						`IPsec pre-shared key for "%s" had no local identifier (pfSense used "My IP address" on a dynamic WAN). It was stored as %%any so strongSwan can match the key; set a real local identifier under VPN → IPsec → Pre-Shared Keys if the peer requires one.`,
 						descr))
 				}
 				psks = append(psks, map[string]any{
@@ -204,13 +204,14 @@ func mapIPsec(pfsense map[string]any, opt *Options, report *Notes) (ipsec, swanc
 
 	for _, raw := range mobile {
 		k := xmlutil.Map(raw)
+		ident := orDefault(xmlutil.AsString(k["ident"]), "%any")
 		psks = append(psks, map[string]any{
 			"@_uuid":       nextUUID(opt),
-			"ident":        xmlutil.AsString(k["ident"]),
+			"ident":        ident,
 			"remote_ident": "",
 			"keyType":      "PSK",
 			"Key":          xmlutil.AsString(k["pre-shared-key"]),
-			"description":  "pfSense mobile key " + xmlutil.AsString(k["ident"]),
+			"description":  "pfSense mobile key " + ident,
 		})
 	}
 
@@ -422,7 +423,13 @@ func pskIdent(localID, localAddr string) string {
 	if localID != "" {
 		return localID
 	}
-	return localAddr
+	if localAddr != "" {
+		return localAddr
+	}
+	// OPNsense writes "id-0 = <ident>" and an empty value never matches.
+	// %any is strongSwan's "any local identity" and is the safe default
+	// when pfSense used "My IP address" on a dynamic WAN.
+	return "%any"
 }
 
 func identValue(typ, data any, fallback string) string {

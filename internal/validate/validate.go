@@ -376,14 +376,14 @@ func checkOpenVPNOut(ctx Context) Check {
 	had := len(xmlutil.AsArray(in["openvpn-server"]))+len(xmlutil.AsArray(in["openvpn-client"]))+len(xmlutil.AsArray(in["openvpn-csc"])) > 0
 	out := opnsense(ctx)
 	legacy := xmlutil.Map(out["openvpn"])
-	if legacy != nil && (legacy["openvpn-server"] != nil || legacy["openvpn-csc"] != nil) {
+	if legacy != nil && (legacy["openvpn-server"] != nil || legacy["openvpn-client"] != nil || legacy["openvpn-csc"] != nil) {
 		return fail("output-openvpn", "output", title, "Legacy <openvpn-server>/<openvpn-csc> is still in the output. OPNsense 26.7 uses VPN → OpenVPN → Instances.")
-	}
-	if !had {
-		return skip("output-openvpn", "output", title, "No OpenVPN in the source config.")
 	}
 	instances := xmlutil.AsArray(xmlutil.Get(out, "OPNsense", "OpenVPN", "Instances", "Instance"))
 	overwrites := xmlutil.AsArray(xmlutil.Get(out, "OPNsense", "OpenVPN", "Overwrites", "Overwrite"))
+	if !had && len(instances) == 0 {
+		return skip("output-openvpn", "output", title, "No OpenVPN in the source config.")
+	}
 	if len(instances) == 0 {
 		return fail("output-openvpn", "output", title, "Source OpenVPN was not mapped to OPNsense/OpenVPN/Instances.")
 	}
