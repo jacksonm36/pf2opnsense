@@ -29,10 +29,10 @@ cd web/ui && npm ci && npm run build && cd ../..
 go build -o pf2opn ./cmd/pf2opn
 ```
 
-UI live reload (proxies `/api` to the binary on `:8080`):
+UI live reload (proxies `/api` to the binary on loopback `:8080`):
 
 ```
-./pf2opn serve -listen :8080
+./pf2opn serve
 cd web/ui && npm run dev
 ```
 
@@ -47,16 +47,15 @@ CLI conversion (validators must pass or the process exits 2 and prints no XML):
 cat config.xml | ./pf2opn convert -pretty=false > opnsense.xml
 ```
 
-HTTP server (UI + `POST /api/convert`):
+HTTP server (UI + `POST /api/convert`). Default listen is **127.0.0.1:8080** so the API is not on LAN/WAN. On OPNsense, leave that default and proxy with `deploy/lighttpd.conf` or `deploy/nginx.conf`. Mapped `config.xml` content is unchanged.
 
 ```
 ./pf2opn serve
-./pf2opn serve -listen :8080
 ./pf2opn serve -listen 127.0.0.1:8080
 ./pf2opn serve -listen unix:/run/pf2opn.sock
 ```
 
-Then open `http://127.0.0.1:8080`. Conversion runs **in the binary**, not in the browser.
+Then open `http://127.0.0.1:8080`. Conversion runs **in the binary**, not in the browser. Unix sockets are mode `0660` (group `www` on OPNsense) so lighttpd can connect without a world-writable socket.
 
 ### nginx
 
@@ -84,11 +83,11 @@ Same idea with `deploy/lighttpd.conf` (`mod_proxy` to `127.0.0.1:8080`, or `host
 docker compose up --build
 ```
 
-Navigate to [`localhost:4200`](http://localhost:4200). The image is the Go binary listening on 8080 (host port 4200).
+Navigate to [`http://127.0.0.1:4200`](http://127.0.0.1:4200). Compose publishes loopback only. The image listens on 8080 inside the container.
 
 ```
 docker build -t pf2opn .
-docker run --name pf2opn -p 4200:8080 -d pf2opn
+docker run --name pf2opn -p 127.0.0.1:4200:8080 -d pf2opn
 ```
 
 ## Tests
@@ -97,4 +96,4 @@ docker run --name pf2opn -p 4200:8080 -d pf2opn
 go test ./...
 ```
 
-The TypeScript mapper under `src/` is a leftover reference. Production conversion is the Go binary; the production UI is Svelte under `web/ui`.
+The TypeScript mapper under `src/` is leftover reference and is not built. Do not `npm install` at the repo root. Production conversion is the Go binary; the production UI is Svelte under `web/ui`.

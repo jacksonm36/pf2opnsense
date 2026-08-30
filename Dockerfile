@@ -20,5 +20,7 @@ RUN adduser -D -H -u 65532 pf2opn
 COPY --from=build /pf2opn /usr/local/bin/pf2opn
 USER pf2opn
 EXPOSE 8080
+# Bind all interfaces *inside* the container so Docker port mapping works.
+# Compose publishes 127.0.0.1:4200 only; on OPNsense use the binary with the default 127.0.0.1:8080 listen.
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
 ENTRYPOINT ["pf2opn", "serve", "-listen", ":8080"]

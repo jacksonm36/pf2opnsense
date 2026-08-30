@@ -8,11 +8,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jacksonm36/pf2opnsense/internal/convert"
 	"github.com/jacksonm36/pf2opnsense/internal/mapper"
 )
+
+const DefaultListen = "127.0.0.1:8080"
 
 func ListenAndServe(addr string, web fs.FS) error {
 	mux := http.NewServeMux()
@@ -28,19 +33,64 @@ func ListenAndServe(addr string, web fs.FS) error {
 	fileServer := http.FileServer(http.FS(sub))
 	mux.Handle("/", fileServer)
 
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    1 << 16,
+	}
+
 	if strings.HasPrefix(addr, "unix:") {
 		path := strings.TrimPrefix(addr, "unix:")
-		_ = os.Remove(path)
-		ln, err := net.Listen("unix", path)
+		ln, err := listenUnix(path)
 		if err != nil {
 			return err
 		}
-		_ = os.Chmod(path, 0o666)
-		log.Printf("pf2opn listening on unix:%s", path)
-		return http.Serve(ln, mux)
+		log.Printf("pf2opn listening on unix:%s (mode 0660)", path)
+		return srv.Serve(ln)
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil && (host == "" || host == "0.0.0.0" || host == "::") {
+		log.Printf("warning: listening on all interfaces (%s); prefer 127.0.0.1:8080 behind OPNsense lighttpd/nginx", addr)
 	}
 	log.Printf("pf2opn listening on %s", addr)
-	return http.ListenAndServe(addr, mux)
+	srv.Addr = addr
+	return srv.ListenAndServe()
+}
+
+// listenUnix binds a socket that the same user (and, on OPNsense, group www) can use.
+// Mode 0660 so a local reverse proxy can connect without making the socket world-writable.
+func listenUnix(path string) (net.Listener, error) {
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		_ = ln.Close()
+		return nil, err
+	}
+	grantProxyGroup(path)
+	return ln, nil
+}
+
+func grantProxyGroup(path string) {
+	for _, name := range []string{"www", "www-data"} {
+		g, err := user.LookupGroup(name)
+		if err != nil {
+			continue
+		}
+		gid, err := strconv.Atoi(g.Gid)
+		if err != nil {
+			continue
+		}
+		if err := os.Chown(path, -1, gid); err != nil {
+			continue
+		}
+		log.Printf("unix socket group set to %s for the local reverse proxy", name)
+		return
+	}
 }
 
 func handleConvert(w http.ResponseWriter, r *http.Request) {
